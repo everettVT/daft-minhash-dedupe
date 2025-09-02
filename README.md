@@ -1,2 +1,10 @@
-# daft-minhash-dedupe
-Week 2
+<div align="center">
+
+# Daft Minhash Deduplication 
+
+Canonical multimodal workload Sandbox for Minhash Deduplication on Common Crawl with Daft
+
+</div>
+
+---
+
