@@ -8,4 +8,5 @@ dependencies = [
     "daft[aws]",
     "python-dotenv",
     "ipykernel",
+    "selectolax",
 ]
