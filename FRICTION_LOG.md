@@ -30,8 +30,9 @@ My point here is that its super common for data engineers to impelement specific
 
 I'd know that Daft can support wildcards if I just looked at the second section of the front page of the guide. The only thing is my eyes breeze right past the demonstrated usage patterns because the pink formatting on the code is so intense. My eyers literally avert themselves from being acausted. (ok dramatic, but that was my subconcious reaction)
 
-### 
+### Pre-processing WARC HTML Payloads 
 
+I'm a bit hesitant to even include this section because I'm not sure my headaches were so much a matter of daft not supplying helpful primatives, and more so  of parsing the warc_content payload. A part from learning about the payload format itself, which is a byte string comprised of both the HTTP header as well as the payload, there were a couple strategies that I tried with daft that didn't end up working the way I expected. 
  
 ## Raw Take
 
