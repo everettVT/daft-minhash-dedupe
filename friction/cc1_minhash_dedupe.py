@@ -12,6 +12,7 @@ from daft.functions import monotonically_increasing_id
 from daft.io import IOConfig, S3Config
 
 from scipy.integrate import quad as integrate
+import igraph as ig
 
 from logging import getLogger, INFO
 
@@ -105,11 +106,9 @@ def optimal_param(
     return opt
 
 def ee(u: Expression, v: Expression):
-    return struct(u.alias("u"), v.alias("v")).alias("e")
+    return struct(u.alias("u"), v.alias("v"))
 
-@daft.func(return_dtype=daft.DataType.list(daft.DataType.uint64()))
-def combine(u: int, v: list[int]):
-    return [u, *v]
+
 
 
 class CommonCrawlHtmlMinHashDedupe:
@@ -266,108 +265,69 @@ class CommonCrawlHtmlMinHashDedupe:
         )
     
     # Connected Components ---------------------------------------------------------
+    # Helper Functions
     def _generate_edges(self, df: DataFrame):
         return (
             df
-            .with_column("left_edge", col("nodes").list.min())
-            .explode("nodes")
-            .select("left_edge", right_edge=col("nodes"))
-            .filter(col("left_edge") != col("right_edge"))
-            .distinct()
+            .with_column("left_edge", col("nodes").list.min()) # grab minimum node as left edge
+            .explode("nodes") # explode the list of nodes into a new row for each node
+            .select("left_edge", right_edge=col("nodes")) # select the left edge and the right edge
+            .filter(col("left_edge") != col("right_edge")) # keep only the edges where the left edge is not equal to the right edge
+            .distinct() # remove duplicates
+            .where(~col("left_edge").is_null()) # filter out any nulls in the left edge
+            .where(~col("right_edge").is_null()) # filter out any nulls in the right edge
+            .select(col("left_edge").alias("u"), col("right_edge").alias("v")) # rename and keep only u and v
         )
-
+    
     def _large_star_phase(self, df: DataFrame):
-        """ Large-Star Operation 
-        
-        1: MAP <u; v>:
-        2:     Emit <u; v> and <v; u>.
-        3: Reduce <u; Γ(u)>:
-        4:     Let m = argmin_(v ∈ Γ+(u)) of l_v
-        5:     Emit <v; m> for all v where l_v > l_u.
-
-        See: https://dl.acm.org/doi/pdf/10.1145/2670979.2670997 (PDF)
-
-        Citation:
-        Raimondas Kiveris, Silvio Lattanzi, Vahab Mirrokni, Vibhor Rastogi, and Sergei Vassilvitskii. 
-        2014. 
-        Connected Components in MapReduce and Beyond. In Proceedings of the ACM Symposium on Cloud Computing (SOCC '14). 
-        Association for Computing Machinery, New York, NY, USA, 1–13. 
-        https://doi.org/10.1145/2670979.2670997
-        """
         return (df
             # large_star_map
             .select("u", "v")
-            .union_all(df.select(col("v").alias("u"), col("u").alias("v")))
+            # Emit U,V and V,U     if v <= u, emit U,V, otherwise emit V,U, keeping naming convention of u and v
             
-            # large_star_reduce
-            .groupby("u").agg_list("v")
-            .with_column("min_edge", col("v").list.min()) # Get minimum of v neighbors
-            .with_column("min_edge", (col("u") <= col("min_edge")).if_else(col("u"), col("min_edge"))) # Get minimum of u and min_edge
-            .explode("v")
-            .where(col("v") > col("u"))   
-            .with_column("e", ee(col("v"), col("min_edge")))
 
-            # Label and remove nulls, duplicates
-            .select("e")
+
+
+
+            .union_all(df.select(col("v").alias("u"), col("u").alias("v")))
+            .groupby("u").agg_list("v")
+            # large_star_reduce
+            .with_column("min_edge", col("v").list.min())
+            .with_column("min_edge", (col("u") <= col("min_edge")).if_else(col("u"), col("min_edge")))
+            .select(col("u").list.map(ee(daft.element(), col("min_edge"))).alias("e"), col("u"))
+            .explode("e")
+            .where(col("e")["v"] > col("u")).select("e")
             .where(~col("e").is_null())
             .distinct()
             .select(col("e")["*"])
             .where(col("u") != col("v"))
-            .collect()
+            .collect() # Materialize
         )
-
-
     
     def _small_star_phase(self, df: DataFrame):
-        """ Small-Star Operation 
-        
-        1: MAP <u; v>:
-        2: if l_v ≤ l_u then: # (if u < v)
-        3:     Emit <u; v>
-        4: else
-        5:     Emit <v; u>
-
-        7: Reduce hu;N ⊆ Γ(u)i:
-        8: Let m = argmin v ∈ N ∪{u} `v.
-        9: Emit hv;mi for all v ∈ N.
-
-        See: https://dl.acm.org/doi/pdf/10.1145/2670979.2670997 (PDF)
-
-        Citation:
-        Raimondas Kiveris, Silvio Lattanzi, Vahab Mirrokni, Vibhor Rastogi, and Sergei Vassilvitskii. 
-        2014. 
-        Connected Components in MapReduce and Beyond. In Proceedings of the ACM Symposium on Cloud Computing (SOCC '14). 
-        Association for Computing Machinery, New York, NY, USA, 1–13. 
-        https://doi.org/10.1145/2670979.2670997
-        """
         return (
             df
-            # small_star_map (emit)
+            # small_star_map
+            .with_column("e", (col("v") <= col("u")).if_else(struct(col("u"), col("v")), struct(col("v").alias("u"), col("u").alias("v"))))
             .select((col("u") > col("v")).if_else(ee(col("u"), col("v")), ee(col("v"), col("u"))).alias("e"))
-            .select(col("e")["*"]) 
-            
-            # small_star_reduce
+            .select(col("e")["*"])
             .groupby("u").agg_list("v")
+            # small_star_reduce
             .with_column("min_edge", col("v").list.min())
             .with_column("min_edge", (col("u") <= col("min_edge")).if_else(col("u"), col("min_edge")))
-            .explode("v")
-            .where(col("v") > col("u"))   
-            .with_column("e", ee(col("v"), col("min_edge")))
-
-            # Clean up
-            .select("e")
+            .select(col("v").list.map(ee(daft.element(), col("min_edge")).alias("v")).alias("e"), col("u"), col("min_edge"))
+            
+            .explode("e")
             .where(~col("e").is_null())
             .distinct()
             .select(col("e")["*"])
-            .collect()
+            .collect() # Materialize
         )
     
     def _check_convergence(self, a: DataFrame, b: DataFrame):
         a_hash = a.select(col("u").hash().alias("hash")).sum("hash").to_pydict()["hash"][0]
         b_hash = b.select(col("u").hash().alias("hash")).sum("hash").to_pydict()["hash"][0]
-        if a_hash == b_hash:
-            return True
-        return False
+        return a_hash == b_hash
     
 
     def connected_components(self, df: DataFrame):
@@ -379,21 +339,23 @@ class CommonCrawlHtmlMinHashDedupe:
             .collect() # Materialize
         )    
 
-        #b = self._canonicalize_edges(b)
-
         # Star Contraction
         while True:
             a = self._large_star_phase(b)
             b = self._small_star_phase(a)
             if self._check_convergence(a, b):
                 break
-        
-        # Return contracted star edges
         return (
             b
             .select(col("u").alias(self.index_col), col("v").alias(self.component_col))
             .collect() # Materialize
         )
+
+    def igraph_connected_components(self, df: DataFrame):
+        g = ig.Graph.DataFrame(df.select(col("u").cast(daft.DataType.int64()), col("v").cast(daft.DataType.int64())).to_pandas(), directed=False)
+        components = {frozenset(c) for c in g.connected_components(mode="strong") if len(c) > 1}
+
+        return components
 
     def merge_results(self, df: DataFrame, assignment: DataFrame):
         df = df.into_batches(100_000)
@@ -461,7 +423,7 @@ if __name__ == "__main__":
     # Define Parameters
     cc_search_pattern = "s3://commoncrawl/crawl-data/CC-MAIN-2024-42/segments/*/warc/*.warc.gz"
     base_uri = "/Users/everett-founder/git/ugh/daft-minhash-dedupe/data"
-    row_limit = 800
+    row_limit = 100
     chunk_size = 200_000
     max_partitions = 2048
     persist_checkpoint = False
@@ -476,25 +438,42 @@ if __name__ == "__main__":
     threshold = 0.717
 
     # Initialize Pipeline
+    if not os.path.exists(f"{base_uri}/checkpoint"):
+        os.makedirs(f"{base_uri}/checkpoint")
+    
+    
     dedupe_pipeline = CommonCrawlHtmlMinHashDedupe(
         output_uri=f"{base_uri}/output",
         checkpoint_uri=f"{base_uri}/checkpoint",
     )
 
-    # Run it
-    results = dedupe_pipeline(
-        cc_warc_uri=cc_search_pattern,
-        row_limit=row_limit,
-        chunk_size=chunk_size,
-        max_partitions=max_partitions,
-        persist_checkpoint=persist_checkpoint,
-        remove_punct=remove_punct,
-        lowercase=lowercase,
-        nfd_unicode=nfd_unicode,
-        white_space=white_space,
-        num_perm=num_perm,
-        ngram_size=ngram_size,
-        seed=seed,
-        hash_function=hash_function,
-        threshold=threshold,
-    )
+    # - / Prep data for Connected Components \ - #
+    if not os.path.exists(f"{base_uri}/checkpoint/bands"):
+        os.makedirs(f"{base_uri}/checkpoint/bands")
+
+        df_raw = dedupe_pipeline.load_data(cc_search_pattern, row_limit=1000)
+        df_prepped = dedupe_pipeline.preprocess(df_raw)
+        df_norm = dedupe_pipeline.normalize(df_prepped)
+        df_minhash = dedupe_pipeline.minhash(df_norm)
+        B, R = optimal_param(threshold, num_perm)
+        df_grouped = dedupe_pipeline.group_bands(df_minhash, R, B)
+
+        # - / CHECKPOINT \ - #
+        df_grouped = dedupe_pipeline.checkpoint(df_grouped, "bands", persist_checkpoint=True)
+    else:
+        df_grouped = daft.read_parquet(f"{base_uri}/checkpoint/bands")
+
+    components = dedupe_pipeline.igraph_connected_components(df_grouped)
+
+    # - / Generate Edges \ - #
+    df_edges = dedupe_pipeline._generate_edges(df_grouped)
+
+    # - / Connected Components \ - #
+    df_assignments = dedupe_pipeline.connected_components(df_edges)
+
+    # - / Merge Results \ - #
+    df_results = dedupe_pipeline.merge_results(df_prepped, df_assignments)
+
+    # - / Write Results \ - #
+    dedupe_pipeline.partitioned_save(df_results, chunk_size, max_partitions, f"{base_uri}/output")
+    

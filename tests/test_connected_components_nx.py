@@ -19,21 +19,39 @@ def _load_module():
 
 
 @pytest.fixture(scope="module")
-def pipeline():
-    mod = _load_module()
-    return mod.CommonCrawlHtmlMinHashDedupe(
+def mod():
+    return _load_module()
+
+
+def test_cc_matches_networkx_deterministic(mod):
+    # Build a deterministic graph with multiple components and some redundancy
+    pipeline = mod.CommonCrawlHtmlMinHashDedupe(
         output_uri=str(PROJECT_ROOT / "data" / "output"),
         checkpoint_uri=str(PROJECT_ROOT / "data" / "checkpoint"),
     )
 
+    # Prep Edges
+    if 
+    cc_uri = 
+    df_raw = pipeline.load_data(cc_uri, row_limit=1000)
+    df_prepped = self.preprocess(df_raw)
+    df_norm = pipeline.normalize(df_prepped)
+    df_minhash = pipeline.minhash(df_norm)
+    B, R = mod.optimal_param(df_minhash)
+    df_grouped = pipeline.group_bands(df_minhash, R, B)
+    df_grouped = pipeline.checkpoint(df_grouped, "bands", persist_checkpoint=True)
 
-def test_cc_matches_networkx_deterministic(pipeline):
-    # Build a deterministic graph with multiple components and some redundancy
-    edges = {
-        (1, 2), (2, 3), (1, 3),  # triangle component {1,2,3}
-        (4, 5),                   # small component {4,5}
-        (6, 7), (7, 8),           # chain {6,7,8}
-    }
+    
+
+
+
+    df_pd_edges = df_edges_clean.to_pandas()
+
+# using networkx @YK we can just pick one. IGraph is faster but only has strong/weak components. 
+nx_graph = nx.from_pandas_edgelist(df_pd_edges, source="u", target="v")
+nx_components = [frozenset(c) for c in nx.connected_components(nx_graph)]
+
+
     left, right = zip(*sorted((min(u, v), max(u, v)) for (u, v) in edges))
     daft_edges = daft.from_pydict({"left_edge": list(left), "right_edge": list(right)})
 
@@ -85,3 +103,23 @@ def test_cc_property_matches_networkx(edges_list, pipeline):
     ours_components = [frozenset(s) for s in by_label.values()]
 
     assert set(ours_components) == set(nx_components)
+
+
+import networkx as nx
+import igraph as ig
+
+df_pd_edges = df_edges_clean.to_pandas()
+
+# using networkx @YK we can just pick one. IGraph is faster but only has strong/weak components. 
+nx_graph = nx.from_pandas_edgelist(df_pd_edges, source="u", target="v")
+nx_components = [frozenset(c) for c in nx.connected_components(nx_graph)]
+
+# using igraph
+g = ig.Graph.DataFrame(df_pd_edges, directed=False)
+strong_components = [frozenset(c) for c in g.connected_components(mode="strong")]
+weak_components = [frozenset(c) for c in g.connected_components(mode="weak")]
+
+print(nx_components)
+print(strong_components)
+print(weak_components)
+assert nx_components == strong_components == weak_components
