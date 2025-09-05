@@ -33,6 +33,10 @@ I'd know that Daft can support wildcards if I just looked at the second section 
 ### Pre-processing WARC HTML Payloads 
 
 I'm a bit hesitant to even include this section because I'm not sure my headaches were so much a matter of daft not supplying helpful primatives, and more so  of parsing the warc_content payload. A part from learning about the payload format itself, which is a byte string comprised of both the HTTP header as well as the payload, there were a couple strategies that I tried with daft that didn't end up working the way I expected. 
+
+### Large Star and Short Star Debugging Headache
+
+By far, the most frustrating part of this workload was trying to debug and understand the graph operations inside the Connected components section. The entire workload algorithm was new to me, but this section really threw me through a loop. I kept running into a strange error relating to 
  
 ## Raw Take
 

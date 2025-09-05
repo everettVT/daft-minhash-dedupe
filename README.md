@@ -2,7 +2,7 @@
 
 # Daft Minhash Deduplication 
 
-Canonical multimodal workload Sandbox for Minhash Deduplication on Common Crawl with Daft
+Canonical Multimodal Workload Sandbox for Minhash Deduplication on Common Crawl with Daft
 
 </div>
 
