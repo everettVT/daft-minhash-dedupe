@@ -56,9 +56,14 @@ def components(
 
              .groupby("u").agg_list("v")
              # large_star_reduce
-             .with_column("min_edge", col("v").list.min())
-             .with_column("min_edge", (col("u") <= col("min_edge")).if_else(col("u"), col("min_edge")))
-             .select(col("u").list.map(ee(daft.element(), col("min_edge"))).alias("e"), col("u"))
+             .with_column("min_edge", col("v").list.min()) # Get minimum of v neighbors
+             .with_column("min_edge", (col("u") <= col("min_edge")).if_else(col("u"), col("min_edge"))) # Get minimum of u and min_edge
+             .select(
+                col("u").list.map(
+                    ee(daft.element(), col("min_edge"))
+                ).alias("e"),
+                col("u")
+            )
 
              .explode("e")
              .where(col("e")["v"] > col("u")).select("e")

@@ -107,16 +107,7 @@ def optimal_param(
 def ee(u: Expression, v: Expression):
     return struct(u.alias("u"), v.alias("v"))
 
-def partitioned_save(df: DataFrame, chunk_size: int, max_partitions: int, output: str):
-    df = df.collect()
-    total_rows = df.count_rows()
-    partitions = max(256, min(math.ceil(total_rows / chunk_size), max_partitions))
 
-    (
-        df.repartition(partitions)
-        .with_column("__pid__", monotonically_increasing_id() / lit(2**36))
-        .write_parquet(output, partition_cols=["__pid__"], write_mode="overwrite", compression="snappy")
-    )
 
 
 class CommonCrawlHtmlMinHashDedupe:
@@ -138,6 +129,7 @@ class CommonCrawlHtmlMinHashDedupe:
 
     def __call__(self,
         cc_warc_uri: str,
+        row_limit: int = 1000,
         chunk_size: int = 200_000,
         max_partitions: int = 2048,
         persist_checkpoint: bool = True,
@@ -153,7 +145,7 @@ class CommonCrawlHtmlMinHashDedupe:
 
     ):
         # Stage 1: Preprocess HTML to extract text
-        df_raw = self.load_data(cc_warc_uri)
+        df_raw = self.load_data(cc_warc_uri, row_limit)
         df_prepped = self.preprocess(df_raw)
         df_prepped = self.checkpoint(df_prepped, "prepped", persist_checkpoint)
 
@@ -166,7 +158,8 @@ class CommonCrawlHtmlMinHashDedupe:
         df_grouped = self.checkpoint(df_grouped, "bands", persist_checkpoint)
         
         # Stage 3: Connected Components
-        df_assignments = self.connected_components(df_grouped)
+        df_edges = self._generate_edges(df_grouped)
+        df_assignments = self.connected_components(df_edges)
         df_assignments = self.checkpoint(df_assignments, "assignments", persist_checkpoint)
 
         # Stage 4: Merge Results
@@ -174,13 +167,13 @@ class CommonCrawlHtmlMinHashDedupe:
         df_results = self.checkpoint(df_results, "results", persist_checkpoint)
 
         # Stage 5: Write Results
-        self.write_results(df_results)
+        self.write_results(df_results, chunk_size, max_partitions)
 
         return df_results
 
     # Checkpoint ------------------------------------------------------------------
     def checkpoint(self, df: daft.DataFrame, stage: str, persist_checkpoint: bool = True):
-        uri = f"{self.checkpoint_dir}/{stage}"
+        uri = f"{self.checkpoint_uri}/{stage}"
         start = time.time()
         if persist_checkpoint:
             df.write_parquet(uri)
@@ -196,8 +189,8 @@ class CommonCrawlHtmlMinHashDedupe:
         return df
 
     # Load Data ------------------------------------------------------------------
-    def load_data(self, uri: str):
-        return daft.read_warc(uri)
+    def load_data(self, uri: str, row_limit: int = 1000):
+        return daft.read_warc(uri).limit(row_limit)
 
     # Preprocess HTML to extract text ----------------------------------------------
     def preprocess(self, df: DataFrame):
@@ -208,7 +201,7 @@ class CommonCrawlHtmlMinHashDedupe:
             .where(col("WARC-Identified-Payload-Type")== "text/html")
             .with_column("content_raw", remove_http_headers(col("warc_content").try_decode("utf-8")))
             .where(col("content_raw") != "")
-            .with_column("content_text", extract_blocks(col("content_raw")).list.join(" "))
+            .with_column(self.content_col, extract_blocks(col("content_raw")).list.join(" "))
 
         )
     
@@ -259,8 +252,8 @@ class CommonCrawlHtmlMinHashDedupe:
         return (
             df
             .with_column("bands", col("min_hashes").list.chunk(R))
-            .with_column("band_idxs", lit(list(range(B))))
-            .explode("bands", "band_idxs")
+            .with_column("band_idx", lit(list(range(B))))
+            .explode("bands", "band_idx")
         )
     
     def group_bands(self, df: DataFrame):
@@ -292,7 +285,6 @@ class CommonCrawlHtmlMinHashDedupe:
             .with_column("min_edge", col("v").list.min())
             .with_column("min_edge", (col("u") <= col("min_edge")).if_else(col("u"), col("min_edge")))
             .select(col("u").list.map(ee(daft.element(), col("min_edge"))).alias("e"), col("u"))
-
             .explode("e")
             .where(col("e")["v"] > col("u")).select("e")
             .where(~col("e").is_null())
@@ -312,7 +304,7 @@ class CommonCrawlHtmlMinHashDedupe:
             # small_star_reduce
             .with_column("min_edge", col("v").list.min())
             .with_column("min_edge", (col("u") <= col("min_edge")).if_else(col("u"), col("min_edge")))
-            .select(col("u").list.map(ee(daft.element(), col("min_edge"))).alias("e"), col("u"), col("min_edge"))
+            .select(col("v").list.map(ee(daft.element(), col("min_edge")).alias("v")).alias("e"), col("u"), col("min_edge"))
             
             .explode("e")
             .where(~col("e").is_null())
@@ -330,21 +322,9 @@ class CommonCrawlHtmlMinHashDedupe:
     
 
     def connected_components(self, df: DataFrame):
-        # Generate edges
-        edges = self._generate_edges(df)
-
-        if edges.count_rows() == 0:
-            partitioned_save(df, self.chunk_size, self.max_partitions, self.output_uri)
-            
-            logger.info("─" * 120)
-            logger.info("No duplicates found.")
-            logger.info(f"Data Output:    {self.output_uri}")
-            logger.info(f"Time:           {time.time() - start_time:.2f}s")
-            logger.info("─" * 120)
-
         # Initialize b
         b = (
-            edges.select(col("left_edge").alias("u"), col("right_edge").alias("v"))
+            df.select(col("left_edge").alias("u"), col("right_edge").alias("v"))
             .where(~col("u").is_null())
             .where(~col("v").is_null())
             .collect() # Materialize
@@ -376,22 +356,35 @@ class CommonCrawlHtmlMinHashDedupe:
             .filter(col(self.component_col).is_null() | (col(self.component_col) == col(self.index_col)))
             .exclude(self.component_col)
         )
-        logger.info("df.explain(show_all=True)")
-        logger.info(df.explain(show_all=True))
 
         return df
     
-    def write_results(self, df: DataFrame):
+    def partitioned_save(self, df: DataFrame, chunk_size: int, max_partitions: int, output: str):
         start_time = time.time()
-        df.write_parquet(self.output_uri, write_mode="overwrite", compression="snappy")
+        df = df.collect()
+        partitions = max(256, min(math.ceil(total_rows / chunk_size), max_partitions))
 
+        (
+            df.repartition(partitions)
+            .with_column("__pid__", monotonically_increasing_id() / lit(2**36))
+            .write_parquet(output, partition_cols=["__pid__"], write_mode="overwrite", compression="snappy")
+        )
+    
+    def log_results(self, prepped: DataFrame, results: DataFrame, start_time: float, end_time: float):
+        logger.info("─" * 80)
+        logger.info("df.explain(show_all=True)")
+        logger.info(results.explain(show_all=True))
+        prepped_rows = prepped.count_rows()
+        results_rows = results.count_rows()
         logger.info("─" * 120)
-        logger.info(f"# of rows before:  {DATA_SIZE}")
-        logger.info(f"# of rows after:   {df.count_rows()}")
-        logger.info(f"% of rows kept:    {FINAL_SIZE / max(0, DATA_SIZE) * 100:.2f}%")
+        logger.info(f"# of rows before:  {prepped_rows}")
+        logger.info(f"# of rows after:   {results_rows}")
+        logger.info(f"% of rows kept:    {results_rows / max(0, prepped_rows) * 100:.2f}%")
         logger.info(f"Output Directory:  {self.output_uri}")
-        logger.info(f"Overall Time:      {time.time() - start_time:.2f}s")
-        logger.info("─" * 120)
+        logger.info(f"Overall Time:      {end_time - start_time:.2f}s")
+        logger.info("─" * 80)
+
+        
 
 
 
@@ -411,13 +404,43 @@ if __name__ == "__main__":
     IO_CONFIG = IOConfig(s3=s3_config)
     daft.set_planning_config(default_io_config=IO_CONFIG)
 
-    base_uri = "s3://minhash-dedupe"
+    # Define Parameters
+    cc_search_pattern = "s3://commoncrawl/crawl-data/CC-MAIN-2024-42/segments/*/warc/*.warc.gz"
+    base_uri = "/Users/everett-founder/git/ugh/daft-minhash-dedupe/data"
+    row_limit = 100
+    chunk_size = 200_000
+    max_partitions = 2048
+    persist_checkpoint = False
+    remove_punct = False
+    lowercase = False
+    nfd_unicode = True
+    white_space = True
+    num_perm = 64
+    ngram_size = 5
+    seed = 42
+    hash_function = 'xxhash'
+    threshold = 0.717
+
+    # Initialize Pipeline
     dedupe_pipeline = CommonCrawlHtmlMinHashDedupe(
         output_uri=f"{base_uri}/output",
         checkpoint_uri=f"{base_uri}/checkpoint",
     )
 
+    # Run it
     results = dedupe_pipeline(
-        cc_warc_uri="s3://commoncrawl/crawl-data/CC-MAIN-2024-42/segments/17332000000000.000/warc/CC-MAIN-2024-42-index-blocks-warc-00000.warc.gz",
-        persist_checkpoint=False
+        cc_warc_uri=cc_search_pattern,
+        row_limit=row_limit,
+        chunk_size=chunk_size,
+        max_partitions=max_partitions,
+        persist_checkpoint=persist_checkpoint,
+        remove_punct=remove_punct,
+        lowercase=lowercase,
+        nfd_unicode=nfd_unicode,
+        white_space=white_space,
+        num_perm=num_perm,
+        ngram_size=ngram_size,
+        seed=seed,
+        hash_function=hash_function,
+        threshold=threshold,
     )
