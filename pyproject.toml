@@ -12,4 +12,5 @@ dependencies = [
     "scipy",
     "matplotlib",
     "numpy",
+    "jupyterlab>=4.4.7",
 ]
