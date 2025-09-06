@@ -146,6 +146,7 @@ class CommonCrawlHtmlMinHashDedupe:
         threshold: float = 0.717,
 
     ):
+        start_time = time.time()
         # Stage 1: Preprocess HTML to extract text
         df_raw = self.load_data(cc_warc_uri, row_limit)
         df_prepped = self.preprocess(df_raw)
@@ -163,13 +164,15 @@ class CommonCrawlHtmlMinHashDedupe:
         df_edges = self._generate_edges(df_grouped)
         df_assignments = self.connected_components(df_edges)
         df_assignments = self.checkpoint(df_assignments, "assignments", persist_checkpoint)
-
+        df_assignments.show()
         # Stage 4: Merge Results
         df_results = self.merge_results(df_prepped, df_assignments)
         df_results = self.checkpoint(df_results, "results", persist_checkpoint)
 
         # Stage 5: Write Results
-        self.write_results(df_results, chunk_size, max_partitions)
+        end_time = time.time()
+        self.log_results(df_prepped, df_results, start_time, end_time)
+        self.partitioned_save(df_results, chunk_size, max_partitions)
 
         return df_results
 
@@ -204,7 +207,7 @@ class CommonCrawlHtmlMinHashDedupe:
             .with_column("content_raw", remove_http_headers(col("warc_content").try_decode("utf-8")))
             .where(col("content_raw") != "")
             .with_column(self.content_col, extract_blocks(col("content_raw")).list.join(" "))
-
+            .with_column(self.index_col, monotonically_increasing_id())
         )
     
     # Normalize Text -------------------------------------------------------------
@@ -238,7 +241,6 @@ class CommonCrawlHtmlMinHashDedupe:
         # Add monotonically increasing id, and generate minhashes
         return (
             df
-            .with_column(self.index_col, monotonically_increasing_id())
             .with_column("min_hashes", 
                 col("content_normalized").minhash(
                     num_hashes = num_perm,
@@ -328,8 +330,8 @@ class CommonCrawlHtmlMinHashDedupe:
         5:     Emit <v; u>
 
         7: Reduce hu;N ⊆ Γ(u)i:
-        8: Let m = argmin v ∈ N ∪{u} `v.
-        9: Emit hv;mi for all v ∈ N.
+        8:     Let m = argmin v ∈ N ∪ {u} `v.
+        9:     Emit <v;m> for all v ∈ N.
 
         See: https://dl.acm.org/doi/pdf/10.1145/2670979.2670997 (PDF)
 
@@ -359,6 +361,7 @@ class CommonCrawlHtmlMinHashDedupe:
             .where(~col("e").is_null())
             .distinct()
             .select(col("e")["*"])
+
             .collect()
         )
     
@@ -380,11 +383,16 @@ class CommonCrawlHtmlMinHashDedupe:
         )    
 
         #b = self._canonicalize_edges(b)
+        check = self.check_igraph(b)
+        print(check)
 
         # Star Contraction
         while True:
             a = self._large_star_phase(b)
+            a.show()
             b = self._small_star_phase(a)
+            b.show()
+            
             if self._check_convergence(a, b):
                 break
         
@@ -395,10 +403,16 @@ class CommonCrawlHtmlMinHashDedupe:
             .collect() # Materialize
         )
 
+    def check_igraph(self, df: DataFrame):
+        import igraph as ig
+        df = df.select(col("u").cast(daft.DataType.int64()), col("v").cast(daft.DataType.int64())).to_pandas()
+        g = ig.Graph.DataFrame(df, directed=False)
+        return {frozenset(c) for c in g.connected_components(mode="strong") if len(c) > 1}
+
     def merge_results(self, df: DataFrame, assignment: DataFrame):
         df = df.into_batches(100_000)
         df = df.join(
-            assignment.select(col(self.index_col), col(self.component_col)).repartition(),
+            assignment.select(col(self.index_col), col(self.component_col)),
             on=self.index_col,
             how="left",
         )
@@ -410,33 +424,30 @@ class CommonCrawlHtmlMinHashDedupe:
 
         return df
     
-    def partitioned_save(self, df: DataFrame, chunk_size: int, max_partitions: int, output: str):
+    def partitioned_save(self, df: DataFrame, chunk_size: int, max_partitions: int):
         start_time = time.time()
         df = df.collect()
         total_rows = df.count_rows()
         partitions = max(256, min(math.ceil(total_rows / chunk_size), max_partitions))
 
         (
-            df.repartition(partitions)
-            .with_column("__pid__", monotonically_increasing_id() / lit(2**36))
-            .write_parquet(output, partition_cols=["__pid__"], write_mode="overwrite", compression="snappy")
+            df #.repartition(partitions)
+            #.with_column("__pid__", monotonically_increasing_id() / lit(2**36))
+            .write_parquet(self.output_uri) #, partition_cols=["__pid__"], write_mode="overwrite", compression="snappy")
         )
         end_time = time.time()
         logger.info(f"Partitioned Saved {total_rows} rows in {end_time - start_time:.2f}s")
     
     def log_results(self, prepped: DataFrame, results: DataFrame, start_time: float, end_time: float):
-        logger.info("─" * 80)
-        logger.info("df.explain(show_all=True)")
-        logger.info(results.explain(show_all=True))
         prepped_rows = prepped.count_rows()
         results_rows = results.count_rows()
-        logger.info("─" * 120)
-        logger.info(f"# of rows before:  {prepped_rows}")
-        logger.info(f"# of rows after:   {results_rows}")
-        logger.info(f"% of rows kept:    {results_rows / max(0, prepped_rows) * 100:.2f}%")
-        logger.info(f"Output Directory:  {self.output_uri}")
-        logger.info(f"Overall Time:      {end_time - start_time:.2f}s")
-        logger.info("─" * 80)
+        print("─" * 80)
+        print(f"# of rows before:  {prepped_rows}")
+        print(f"# of rows after:   {results_rows}")
+        print(f"% of rows kept:    {results_rows / max(0, prepped_rows) * 100:.2f}%")
+        print(f"Output Directory:  {self.output_uri}")
+        print(f"Overall Time:      {end_time - start_time:.2f}s")
+        print("─" * 80)
 
         
 
@@ -461,10 +472,10 @@ if __name__ == "__main__":
     # Define Parameters
     cc_search_pattern = "s3://commoncrawl/crawl-data/CC-MAIN-2024-42/segments/*/warc/*.warc.gz"
     base_uri = "/Users/everett-founder/git/ugh/daft-minhash-dedupe/data"
-    row_limit = 800
+    row_limit = 100
     chunk_size = 200_000
     max_partitions = 2048
-    persist_checkpoint = False
+    persist_checkpoint = True
     remove_punct = False
     lowercase = False
     nfd_unicode = True

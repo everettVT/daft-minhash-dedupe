@@ -104,7 +104,7 @@ def test_cc_property_matches_networkx(edges_list, pipeline):
 
     assert set(ours_components) == set(nx_components)
 
-
+# Saving for later....
 import networkx as nx
 import igraph as ig
 
