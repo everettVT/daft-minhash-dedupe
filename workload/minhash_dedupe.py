@@ -12,6 +12,7 @@ from daft.functions import monotonically_increasing_id
 from daft.io import IOConfig, S3Config
 
 from scipy.integrate import quad as integrate
+from uuid_utils import UUID 
 
 from logging import getLogger, INFO
 
@@ -32,7 +33,7 @@ def extract_blocks(html: str) -> list[str]:
     tree = HTMLParser(html)
     for n in tree.css("script,style,noscript"):  n.decompose()
     blocks = []
-    for node in tree.css("article, main, p, h1, h2, h3, li"):
+    for node in tree.css("article, main, p, h1, h2, h3, li, div, section"):
         txt = node.text(separator=" ", strip=True)
         if not txt: 
             continue
@@ -107,9 +108,7 @@ def optimal_param(
 def ee(u: Expression, v: Expression):
     return struct(u.alias("u"), v.alias("v")).alias("e")
 
-@daft.func(return_dtype=daft.DataType.list(daft.DataType.uint64()))
-def combine(u: int, v: list[int]):
-    return [u, *v]
+
 
 
 class CommonCrawlHtmlMinHashDedupe:
@@ -117,9 +116,9 @@ class CommonCrawlHtmlMinHashDedupe:
     def __init__(self, 
         output_uri: str,
         checkpoint_uri: str,
-        index_col: str = "__id__", 
-        content_col: str = "__content_text__", 
-        component_col: str = "__component__",
+        index_col: str = "WARC-Record-ID", 
+        content_col: str = "content_text", 
+        component_col: str = "component",
     ):
         
         self.output_uri = output_uri
@@ -162,9 +161,24 @@ class CommonCrawlHtmlMinHashDedupe:
         
         # Stage 3: Connected Components
         df_edges = self._generate_edges(df_grouped)
+        df_edges = self.checkpoint(df_edges, "edges", persist_checkpoint)
+
+        df_assignments2 = self.connected_components_2(df_edges)
+        df_assignments2 = self.checkpoint(df_assignments2, "assignments2", persist_checkpoint)
+        df_assignments2.show()
+
+
+
+
+
         df_assignments = self.connected_components(df_edges)
         df_assignments = self.checkpoint(df_assignments, "assignments", persist_checkpoint)
         df_assignments.show()
+
+
+
+
+
         # Stage 4: Merge Results
         df_results = self.merge_results(df_prepped, df_assignments)
         df_results = self.checkpoint(df_results, "results", persist_checkpoint)
@@ -184,6 +198,8 @@ class CommonCrawlHtmlMinHashDedupe:
             df.write_parquet(uri)
         else:
             df.collect()
+            print(f"Checkpoint {stage} saved")
+            df.show()
         end = time.time()
         logger.info(f"Finished {stage} stage in {end-start} sec")
         
@@ -207,7 +223,6 @@ class CommonCrawlHtmlMinHashDedupe:
             .with_column("content_raw", remove_http_headers(col("warc_content").try_decode("utf-8")))
             .where(col("content_raw") != "")
             .with_column(self.content_col, extract_blocks(col("content_raw")).list.join(" "))
-            .with_column(self.index_col, monotonically_increasing_id())
         )
     
     # Normalize Text -------------------------------------------------------------
@@ -278,6 +293,135 @@ class CommonCrawlHtmlMinHashDedupe:
             .distinct()
         )
 
+    def _canonicalize_edges(self, df: DataFrame) -> DataFrame:
+    # Always direct from larger id -> smaller id, drop self-loops & dups
+        return (
+            df.select(
+                (col("u") >= col("v")).if_else(col("u"), col("v")).alias("u"),
+                (col("u") >= col("v")).if_else(col("v"), col("u")).alias("v"),
+            )
+            .where(col("u") != col("v"))
+            .distinct()
+            .collect()
+        )
+
+    def _symmetrize(self, df: DataFrame) -> DataFrame:
+        # Make undirected by adding both directions
+        return (
+            df.select("u", "v")
+            .union_all(df.select(col("v").alias("u"), col("u").alias("v")))
+            .distinct()
+            .collect()
+        )
+
+    def _build_node_id_map(self, edges: DataFrame) -> DataFrame:
+        # Gather all node IDs (as strings), assign unique int64 IDs
+        nodes = (
+            edges.select(col("left_edge").alias(self.index_col))
+                .union_all(edges.select(col("right_edge").alias(self.index_col)))
+                .where(~col(self.index_col).is_null())
+                .distinct()
+                .with_column("node_id", monotonically_increasing_id().cast(daft.DataType.int64()))
+                .collect()
+        )
+        return nodes  # [self.index_col (str), node_id (int64)]
+
+    def _edges_to_numeric(self, edges: DataFrame, id_map: DataFrame) -> DataFrame:
+        # Join twice to get numeric u,v
+        left = edges.join(id_map, left_on="left_edge", right_on=self.index_col).rename({ "node_id": "u" })
+        both = left.join(id_map, left_on="right_edge", right_on=self.index_col).rename({ "node_id": "v" })
+        return both.select(col("u").cast(daft.DataType.int64()), col("v").cast(daft.DataType.int64())).collect()
+
+    def _assignments_back_to_strings(self, assigns: DataFrame, id_map: DataFrame) -> DataFrame:
+        # assigns: [u(int64), rep(int64)] → [index_col(str), component_col(str)]
+        a1 = assigns.join(id_map.rename({self.index_col: "__u_str"}), left_on="u", right_on="node_id")
+        a2 = a1.join(id_map.rename({self.index_col: "__rep_str"}), left_on="rep", right_on="node_id")
+        return a2.select(
+            col("__u_str").alias(self.index_col),
+            col("__rep_str").alias(self.component_col)
+        ).collect()
+
+    def _large_star_phase_2(self, edges: DataFrame) -> DataFrame:
+        # Undirected neighborhood via symmetrization
+        E = self._symmetrize(edges)
+
+        # Γ(u) as list, m = min(Γ⁺(u))
+        neigh = (
+            E.groupby("u")
+            .agg(col("v").agg_list().alias("nbrs"))
+            .with_column("m", col("nbrs").list.min())
+            .with_column("m", (col("u") < col("m")).if_else(col("u"), col("m")))
+        )
+
+        # Emit (v, m(u)) for v > u
+        out = (
+            neigh.explode("nbrs")
+                .where(col("nbrs") > col("u"))
+                .select(col("nbrs").alias("u"), col("m").alias("v"))
+                .distinct()
+                .collect()
+        )
+        return out
+
+    def _small_star_phase_2(self, edges: DataFrame) -> DataFrame:
+        # Direct edges high -> low (canonical)
+        directed = self._canonicalize_edges(edges)
+
+        # N(u) = list of lower neighbors v (since u >= v by construction)
+        neigh = (
+            directed.groupby("u")
+                    .agg(col("v").agg_list().alias("nbrs"))
+                    .with_column("m", col("nbrs").list.min())
+                    .with_column("m", (col("u") < col("m")).if_else(col("u"), col("m")))
+        )
+
+        # Emit (v, m(u)) for all v in N(u)
+        out = (
+            neigh.explode("nbrs")
+                .select(col("nbrs").alias("u"), col("m").alias("v"))
+                .distinct()
+                .collect()
+        )
+        return out
+
+    def _check_convergence_2(self, a: DataFrame, b: DataFrame) -> bool:
+        ca = self._canonicalize_edges(a)
+        cb = self._canonicalize_edges(b)
+        # a \ b and b \ a both empty => equal
+        left_minus  = ca.join(cb, on=["u","v"], how="anti").count_rows()
+        right_minus = cb.join(ca, on=["u","v"], how="anti").count_rows()
+        return (left_minus == 0) and (right_minus == 0)
+
+    def connected_components_2(self, df: DataFrame) -> DataFrame:
+        # Start from generated edges; drop nulls and canonicalize
+        b = (
+            df.select(col("left_edge").alias("u"), col("right_edge").alias("v"))
+            .where(~col("u").is_null()).where(~col("v").is_null())
+            .collect()
+        )
+        b = self._canonicalize_edges(b)
+
+        # Optional: sanity check with igraph
+        print(self.igraph_connected_components(b))
+
+        # Star contraction
+        while True:
+            a = self._large_star_phase_2(b)
+            b = self._small_star_phase_2(a)
+            if self._check_convergence_2(a, b):
+                break
+
+        # After convergence, choose minimal representative per node
+        assignments = (
+            b.groupby("u").agg(col("v").min().alias("rep"))
+            .select(col("u").alias(self.index_col), col("rep").alias(self.component_col))
+            .collect()
+        )
+        assignments.show()
+        return assignments
+
+
+
     def _large_star_phase(self, df: DataFrame):
         """ Large-Star Operation 
         
@@ -324,12 +468,12 @@ class CommonCrawlHtmlMinHashDedupe:
         """ Small-Star Operation 
         
         1: MAP <u; v>:
-        2: if l_v ≤ l_u then: # (if u < v)
+        2: if l_v ≤ l_u then: # (if u >= v)
         3:     Emit <u; v>
         4: else
         5:     Emit <v; u>
 
-        7: Reduce hu;N ⊆ Γ(u)i:
+        7: Reduce <u; N ⊆ Γ(u)>:
         8:     Let m = argmin v ∈ N ∪ {u} `v.
         9:     Emit <v;m> for all v ∈ N.
 
@@ -345,18 +489,17 @@ class CommonCrawlHtmlMinHashDedupe:
         return (
             df
             # small_star_map (emit)
-            .select((col("u") > col("v")).if_else(ee(col("u"), col("v")), ee(col("v"), col("u"))).alias("e"))
+            .select((col("u") >= col("v")).if_else(ee(col("u"), col("v")), ee(col("v"), col("u"))).alias("e"))
             .select(col("e")["*"]) 
             
             # small_star_reduce
             .groupby("u").agg_list("v")
             .with_column("min_edge", col("v").list.min())
-            .with_column("min_edge", (col("u") <= col("min_edge")).if_else(col("u"), col("min_edge")))
-            .explode("v")
-            .where(col("v") > col("u"))   
+            .with_column("min_edge", (col("u") < col("min_edge")).if_else(col("u"), col("min_edge")))
+            .explode("v")  
             .with_column("e", ee(col("v"), col("min_edge")))
 
-            # Clean up
+            # Clean up label, remove nulls/duplicates
             .select("e")
             .where(~col("e").is_null())
             .distinct()
@@ -371,6 +514,13 @@ class CommonCrawlHtmlMinHashDedupe:
         if a_hash == b_hash:
             return True
         return False
+        
+    
+    def igraph_connected_components(self, df: DataFrame):
+        import igraph as ig
+        df = df.select(col("u").cast(daft.DataType.int64()), col("v").cast(daft.DataType.int64())).to_pandas()
+        g = ig.Graph.DataFrame(df, directed=False)
+        return {frozenset(c) for c in g.connected_components(mode="weak") if len(c) > 1}
     
 
     def connected_components(self, df: DataFrame):
@@ -383,8 +533,8 @@ class CommonCrawlHtmlMinHashDedupe:
         )    
 
         #b = self._canonicalize_edges(b)
-        check = self.check_igraph(b)
-        print(check)
+        ig_components = self.igraph_connected_components(b)
+        print(ig_components)
 
         # Star Contraction
         while True:
@@ -402,12 +552,6 @@ class CommonCrawlHtmlMinHashDedupe:
             .select(col("u").alias(self.index_col), col("v").alias(self.component_col))
             .collect() # Materialize
         )
-
-    def check_igraph(self, df: DataFrame):
-        import igraph as ig
-        df = df.select(col("u").cast(daft.DataType.int64()), col("v").cast(daft.DataType.int64())).to_pandas()
-        g = ig.Graph.DataFrame(df, directed=False)
-        return {frozenset(c) for c in g.connected_components(mode="strong") if len(c) > 1}
 
     def merge_results(self, df: DataFrame, assignment: DataFrame):
         df = df.into_batches(100_000)
@@ -444,7 +588,7 @@ class CommonCrawlHtmlMinHashDedupe:
         print("─" * 80)
         print(f"# of rows before:  {prepped_rows}")
         print(f"# of rows after:   {results_rows}")
-        print(f"% of rows kept:    {results_rows / max(0, prepped_rows) * 100:.2f}%")
+        print(f"% of rows kept:    {results_rows / max(1, prepped_rows) * 100:.2f}%")
         print(f"Output Directory:  {self.output_uri}")
         print(f"Overall Time:      {end_time - start_time:.2f}s")
         print("─" * 80)
@@ -454,9 +598,12 @@ class CommonCrawlHtmlMinHashDedupe:
 
 
 if __name__ == "__main__":
+    import pathlib
     from dotenv import load_dotenv
 
     load_dotenv()
+
+    WORKDIR = "/Users/everett-founder/git/ugh/daft-minhash-dedupe/workload"
 
     s3_config = S3Config(
         region_name="us-east-1",
