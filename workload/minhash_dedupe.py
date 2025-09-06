@@ -12,9 +12,11 @@ from daft.functions import monotonically_increasing_id
 from daft.io import IOConfig, S3Config
 
 from scipy.integrate import quad as integrate
-from uuid_utils import UUID 
+
 
 from logging import getLogger, INFO
+
+from .utils import optimal_param, checkpoint, partitioned_save, log_results
 
 logger = getLogger(__name__)
 logger.setLevel(INFO)
@@ -31,140 +33,121 @@ def remove_http_headers(x: str) -> str:
 @daft.func()
 def extract_blocks(html: str) -> list[str]:
     tree = HTMLParser(html)
-    for n in tree.css("script,style,noscript"):  n.decompose()
+    for n in tree.css("script,style,noscript"):
+        n.decompose()
+
     blocks = []
-    for node in tree.css("article, main, p, h1, h2, h3, li, div, section"):
+    for node in tree.css("""title, article, main, p, h1, h2, h3, h4, h5, h6, li, div, section, img[alt], figcaption, caption, blockquote, table th, table td, pre, code, summary, meta[name="description"], meta[property="og:title"], meta[property="og:description"]"""):
         txt = node.text(separator=" ", strip=True)
-        if not txt: 
-            continue
-        blocks.append(txt)
+        if txt: 
+            blocks.append(txt)
     return blocks
 
+@daft.func()
+def get_block_idx(blocks: list[str]) -> list[int]:
+    return list(range(len(blocks)))
 
-def optimal_param(
-    threshold: float,
-    num_perm: int,
-    false_positive_weight: float = 0.5,
-    false_negative_weight: float = 0.5,
-):
-    """
-    Compute the optimal `MinHashLSH` parameter that minimizes the weighted sum
-    of probabilities of false positive and false negative, taken from datasketch.
-
-    Parameters
-    ----------
-    threshold : float
-        The threshold for similarity.
-    num_perm : int
-        The number of permutations.
-    false_positive_weight : float
-        The weight of false positive.
-    false_negative_weight : float
-        The weight of false negative.
-
-    Returns
-    -------
-    Tuple[int, int]
-        The optimal `b` and `r` parameters.
-        The number of bands, and the number of rows per band respectively.
-
-    Examples
-    --------
-    >>> optimal_param(0.7, 256)
-    (25, 10)
-    """
-
-    def false_positive_area(threshold: float, b: int, r: int):
-        """Source: `datasketch.lsh`"""
-
-        def area(s):
-            return 1 - (1 - s ** float(r)) ** float(b)
-
-        a, _ = integrate(area, 0.0, threshold)
-        return a
-
-    def false_negative_area(threshold: float, b: int, r: int):
-        """Source: `datasketch.lsh`"""
-
-        def area(s):
-            return 1 - (1 - (1 - s ** float(r)) ** float(b))
-
-        a, _ = integrate(area, threshold, 1.0)
-        return a
-
-    min_error = float("inf")
-    opt = (0, 0)
-    for b in range(1, num_perm + 1):
-        max_r = int(num_perm / b)
-        for r in range(1, max_r + 1):
-            fp = false_positive_area(threshold, b, r)
-            fn = false_negative_area(threshold, b, r)
-            error = fp * false_positive_weight + fn * false_negative_weight
-            if error < min_error:
-                min_error = error
-                opt = (b, r)
-    return opt
 
 def ee(u: Expression, v: Expression):
     return struct(u.alias("u"), v.alias("v")).alias("e")
 
+def preprocess_common_crawl_html(uri: str, row_limit: int = 1000, index_col: str = "block_id", content_col: str = "block_text"):
+    df_warc = daft.read_warc(uri).limit(row_limit)
+
+    df_html = (
+        df_warc
+        .where(col("WARC-Identified-Payload-Type")== "text/html")
+        .with_column("content_raw", remove_http_headers(col("warc_content").try_decode("utf-8")))
+        .where(col("content_raw") != "")
+    )  
+
+    df_text = (
+        df_html
+        .with_column("blocks", extract_blocks(col("content_raw")))
+        .with_column("block_idx", get_block_idx(col("blocks")))
+        .explode("blocks", "block_idx")
+        .where(col("blocks") != "")
+        .where(col("blocks").not_null())
+        .with_column(index_col, col("WARC-Record-ID")+ "-" + col("block_idx"))
+        .with_column(content_col, col("blocks"))
+        .select(
+            "WARC-Record-ID",
+            index_col,
+            content_col,
+        )
+    )
+    return df_text
 
 
+class MinHashDedupePipeline:
 
-class CommonCrawlHtmlMinHashDedupe:
-
-    def __init__(self, 
+    def __init__(self,
         output_uri: str,
         checkpoint_uri: str,
-        index_col: str = "WARC-Record-ID", 
-        content_col: str = "content_text", 
+        index_col: str = "block_id", 
+        content_col: str = "block_text", 
         component_col: str = "component",
+        num_perm: int = 64,
+        ngram_size: int = 5,
+        threshold: float = 0.7,
+        seed: int = 42,
+        hash_function: str = 'xxhash',
+        remove_punct: bool = True,
+        lowercase: bool = False,
+        nfd_unicode: bool = True,
+        white_space: bool = True,
     ):
-        
         self.output_uri = output_uri
         self.checkpoint_uri = checkpoint_uri
         self.index_col = index_col
         self.content_col = content_col
         self.component_col = component_col
+        self.num_perm = num_perm
+        self.ngram_size = ngram_size
+        self.threshold = threshold
+        self.seed = seed
+        self.hash_function = hash_function
+        self.remove_punct = remove_punct
+        self.lowercase = lowercase
+        self.nfd_unicode = nfd_unicode
+        self.white_space = white_space
 
+        B, R = optimal_param(threshold, num_perm)
+        assert B * R == num_perm, "B * R must equal num_perm"
+        self.B = B
+        self.R = R
 
-    def __call__(self,
+    def run(self,
         cc_warc_uri: str,
         row_limit: int = 1000,
-        chunk_size: int = 200_000,
-        max_partitions: int = 2048,
-        persist_checkpoint: bool = True,
-        remove_punct: bool = False,
-        lowercase: bool = False,
-        nfd_unicode: bool = True,
-        white_space: bool = True,
-        num_perm: int = 64,
-        ngram_size: int = 5,
-        seed: int = 42,
-        hash_function: str = 'xxhash',
-        threshold: float = 0.717,
+        checkpoints_active = True,
 
     ):
+        
         start_time = time.time()
+        
+
         # Stage 1: Preprocess HTML to extract text
         df_raw = self.load_data(cc_warc_uri, row_limit)
         df_prepped = self.preprocess(df_raw)
-        df_prepped = self.checkpoint(df_prepped, "prepped", persist_checkpoint)
+
+        df_prepped = checkpoint(self.checkpoint_uri, df_prepped, "prepped", checkpoints_active)
 
         # Stage 2: Normalize Text, MinHash, and Band Generation
-        df_norm = self.normalize(df_prepped, remove_punct, lowercase, nfd_unicode, white_space)
-        df_minhash = self.minhash(df_norm, num_perm, ngram_size, seed, hash_function)
-        B, R = optimal_param(threshold, num_perm)
-        df_band = self.band_generation(df_minhash, R, B)
+        df_norm    = self.normalize(df_prepped, self.remove_punct, self.lowercase, self.nfd_unicode, self.white_space)
+        df_minhash = self.minhash(df_norm, self.num_perm, self.ngram_size, self.seed, self.hash_function)
+        df_band    = self.band_generation(df_minhash, self.R, self.B)
         df_grouped = self.group_bands(df_band)
-        df_grouped = self.checkpoint(df_grouped, "bands", persist_checkpoint)
+
+        df_grouped = checkpoint(self.checkpoint_uri, df_grouped, "bands", checkpoints_active)
         
-        # Stage 3: Connected Components
+        # Stage 3: Connected Components 
         df_edges = self._generate_edges(df_grouped)
-        df_edges = self.checkpoint(df_edges, "edges", persist_checkpoint)
+        df_edges = checkpoint(self.checkpoint_uri, df_edges, "edges", checkpoints_active)
+
 
         df_assignments2 = self.connected_components_2(df_edges)
-        df_assignments2 = self.checkpoint(df_assignments2, "assignments2", persist_checkpoint)
+        df_assignments2 = checkpoint(self.checkpoint_uri, df_assignments2, "assignments2", checkpoints_active)
         df_assignments2.show()
 
 
@@ -172,7 +155,7 @@ class CommonCrawlHtmlMinHashDedupe:
 
 
         df_assignments = self.connected_components(df_edges)
-        df_assignments = self.checkpoint(df_assignments, "assignments", persist_checkpoint)
+        df_assignments = checkpoint(self.checkpoint_uri, df_assignments, "assignments", checkpoints_active)
         df_assignments.show()
 
 
@@ -181,33 +164,14 @@ class CommonCrawlHtmlMinHashDedupe:
 
         # Stage 4: Merge Results
         df_results = self.merge_results(df_prepped, df_assignments)
-        df_results = self.checkpoint(df_results, "results", persist_checkpoint)
+        df_results = checkpoint(self.checkpoint_uri, df_results, "results", checkpoints_active)
 
         # Stage 5: Write Results
         end_time = time.time()
         self.log_results(df_prepped, df_results, start_time, end_time)
         self.partitioned_save(df_results, chunk_size, max_partitions)
 
-        return df_results
-
-    # Checkpoint ------------------------------------------------------------------
-    def checkpoint(self, df: daft.DataFrame, stage: str, persist_checkpoint: bool = True):
-        uri = f"{self.checkpoint_uri}/{stage}"
-        start = time.time()
-        if persist_checkpoint:
-            df.write_parquet(uri)
-        else:
-            df.collect()
-            print(f"Checkpoint {stage} saved")
-            df.show()
-        end = time.time()
-        logger.info(f"Finished {stage} stage in {end-start} sec")
-        
-        # Read Saved Checkpoint if needed
-        if persist_checkpoint:
-            df = daft.read_parquet(uri)
-        
-        return df
+        return df_results    
 
     # Load Data ------------------------------------------------------------------
     def load_data(self, uri: str, row_limit: int = 1000):
@@ -222,7 +186,7 @@ class CommonCrawlHtmlMinHashDedupe:
             .where(col("WARC-Identified-Payload-Type")== "text/html")
             .with_column("content_raw", remove_http_headers(col("warc_content").try_decode("utf-8")))
             .where(col("content_raw") != "")
-            .with_column(self.content_col, extract_blocks(col("content_raw")).list.join(" "))
+            .with_column("content_text", extract_blocks(col("content_raw")).list.join(" "))
         )
     
     # Normalize Text -------------------------------------------------------------
@@ -236,7 +200,7 @@ class CommonCrawlHtmlMinHashDedupe:
         return (
             df
             .with_column("content_normalized", 
-                col(self.content_col).str.normalize(
+                col("content_text").str.normalize(
                     remove_punct=remove_punct, 
                     lowercase=lowercase, 
                     nfd_unicode=nfd_unicode, 
@@ -293,27 +257,6 @@ class CommonCrawlHtmlMinHashDedupe:
             .distinct()
         )
 
-    def _canonicalize_edges(self, df: DataFrame) -> DataFrame:
-    # Always direct from larger id -> smaller id, drop self-loops & dups
-        return (
-            df.select(
-                (col("u") >= col("v")).if_else(col("u"), col("v")).alias("u"),
-                (col("u") >= col("v")).if_else(col("v"), col("u")).alias("v"),
-            )
-            .where(col("u") != col("v"))
-            .distinct()
-            .collect()
-        )
-
-    def _symmetrize(self, df: DataFrame) -> DataFrame:
-        # Make undirected by adding both directions
-        return (
-            df.select("u", "v")
-            .union_all(df.select(col("v").alias("u"), col("u").alias("v")))
-            .distinct()
-            .collect()
-        )
-
     def _build_node_id_map(self, edges: DataFrame) -> DataFrame:
         # Gather all node IDs (as strings), assign unique int64 IDs
         nodes = (
@@ -340,6 +283,27 @@ class CommonCrawlHtmlMinHashDedupe:
             col("__u_str").alias(self.index_col),
             col("__rep_str").alias(self.component_col)
         ).collect()
+
+    def _canonicalize_edges(self, df: DataFrame) -> DataFrame:
+        # Always direct from larger id -> smaller id, drop self-loops & dups
+        return (
+            df.select(
+                (col("u") >= col("v")).if_else(col("u"), col("v")).alias("u"),
+                (col("u") >= col("v")).if_else(col("v"), col("u")).alias("v"),
+            )
+            .where(col("u") != col("v"))
+            .distinct()
+            .collect()
+        )
+
+    def _symmetrize(self, df: DataFrame) -> DataFrame:
+        # Make undirected by adding both directions
+        return (
+            df.select("u", "v")
+            .union_all(df.select(col("v").alias("u"), col("u").alias("v")))
+            .distinct()
+            .collect()
+        )
 
     def _large_star_phase_2(self, edges: DataFrame) -> DataFrame:
         # Undirected neighborhood via symmetrization
@@ -568,42 +532,19 @@ class CommonCrawlHtmlMinHashDedupe:
 
         return df
     
-    def partitioned_save(self, df: DataFrame, chunk_size: int, max_partitions: int):
-        start_time = time.time()
-        df = df.collect()
-        total_rows = df.count_rows()
-        partitions = max(256, min(math.ceil(total_rows / chunk_size), max_partitions))
 
-        (
-            df #.repartition(partitions)
-            #.with_column("__pid__", monotonically_increasing_id() / lit(2**36))
-            .write_parquet(self.output_uri) #, partition_cols=["__pid__"], write_mode="overwrite", compression="snappy")
-        )
-        end_time = time.time()
-        logger.info(f"Partitioned Saved {total_rows} rows in {end_time - start_time:.2f}s")
-    
-    def log_results(self, prepped: DataFrame, results: DataFrame, start_time: float, end_time: float):
-        prepped_rows = prepped.count_rows()
-        results_rows = results.count_rows()
-        print("─" * 80)
-        print(f"# of rows before:  {prepped_rows}")
-        print(f"# of rows after:   {results_rows}")
-        print(f"% of rows kept:    {results_rows / max(1, prepped_rows) * 100:.2f}%")
-        print(f"Output Directory:  {self.output_uri}")
-        print(f"Overall Time:      {end_time - start_time:.2f}s")
-        print("─" * 80)
 
-        
 
 
 
 if __name__ == "__main__":
+    import ray
     import pathlib
     from dotenv import load_dotenv
 
     load_dotenv()
 
-    WORKDIR = "/Users/everett-founder/git/ugh/daft-minhash-dedupe/workload"
+    WORKDIR = pathlib.Path(__file__).parent
 
     s3_config = S3Config(
         region_name="us-east-1",
@@ -617,41 +558,64 @@ if __name__ == "__main__":
     daft.set_planning_config(default_io_config=IO_CONFIG)
 
     # Define Parameters
-    cc_search_pattern = "s3://commoncrawl/crawl-data/CC-MAIN-2024-42/segments/*/warc/*.warc.gz"
-    base_uri = "/Users/everett-founder/git/ugh/daft-minhash-dedupe/data"
-    row_limit = 100
-    chunk_size = 200_000
-    max_partitions = 2048
-    persist_checkpoint = True
-    remove_punct = False
-    lowercase = False
-    nfd_unicode = True
-    white_space = True
+    cc_segment = "CC-MAIN-2024-42"
+    save_uri = WORKDIR / "data" # For local testing, replace with s3 uri for cloud
+    ROW_LIMIT = 500
+    
+    
+
+    # MinHash Parameters
     num_perm = 64
     ngram_size = 5
     seed = 42
     hash_function = 'xxhash'
     threshold = 0.717
 
-    # Initialize Pipeline
-    dedupe_pipeline = CommonCrawlHtmlMinHashDedupe(
-        output_uri=f"{base_uri}/output",
-        checkpoint_uri=f"{base_uri}/checkpoint",
+    # Text Normalization Parameters
+    remove_punct = False
+    lowercase = False
+    nfd_unicode = True
+    white_space = True
+
+    # Partitioned Save Parameters
+    chunk_size = 200_000
+    max_partitions = 2048
+    persist_checkpoint = True
+
+
+    # PIPELINE -------------------------------------------------------------
+    # Preprocess Common Crawl HTML and Persist
+    df_prepped = preprocess_common_crawl_html(
+        uri=f"s3://commoncrawl/crawl-data/{cc_segment}/segments/*/warc/*.warc.gz",
+        row_limit=ROW_LIMIT,
+        index_col="block_id",
+        content_col="block_text",
+        component_col="component",
     )
 
+    if ray.is_initialized():
+        partitioned_save(df_prepped, save_uri, chunk_size, max_partitions)
+    else:
+        df_prepped = df_prepped.write_parquet(save_uri+ "/prepped", compression="snappy")
+
     # Run it
-    results = dedupe_pipeline(
-        cc_warc_uri=cc_search_pattern,
-        row_limit=row_limit,
-        chunk_size=chunk_size,
-        max_partitions=max_partitions,
-        persist_checkpoint=persist_checkpoint,
+    mh_pipeline= MinHashDedupePipeline(
+        output_uri=save_uri + "/output",
+        checkpoint_uri=save_uri + "/checkpoint",
+        index_col="block_id",
+        content_col="block_text",
+        component_col="component",
+    )
+    results = mh_pipeline.run(
+        prepped_uri=save_uri + "/prepped",
+
+        checkpoints_active=persist_checkpoint,
         remove_punct=remove_punct,
         lowercase=lowercase,
-        nfd_unicode=nfd_unicode,
+        nfd_unicode=nfd_unicode,   
         white_space=white_space,
         num_perm=num_perm,
-        ngram_size=ngram_size,
+        ngram_size=ngram_size,   
         seed=seed,
         hash_function=hash_function,
         threshold=threshold,

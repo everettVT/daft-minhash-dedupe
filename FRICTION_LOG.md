@@ -34,6 +34,13 @@ I'd know that Daft can support wildcards if I just looked at the second section 
 
 I'm a bit hesitant to even include this section because I'm not sure my headaches were so much a matter of daft not supplying helpful primatives, and more so  of parsing the warc_content payload. A part from learning about the payload format itself, which is a byte string comprised of both the HTTP header as well as the payload, there were a couple strategies that I tried with daft that didn't end up working the way I expected. 
 
+### 
+I'm running into this funny moment where I want to take the minimum between a known variable and a calculated row-wise vairable and can't think of how to do it without a a row-wise udf. In the band explosion, if you use the naive B, then you risk trying to create entries for minhashes that dont exist. 
+
+I ran into this when I transitioned the pipeline from full document deduplication to block level deduplication where an individual block may have less than `B` tokens in it's contents. 
+
+For now I'll just stick with a udf since its intutive, but since I have to derive a `min` argumnet from an existing column, the operation turns into more steps than I would have liked. This pain point is fundamentally due to not being able to easily append or build lists. 
+
 ### Large Star and Short Star Debugging Headache
 
 By far, the most frustrating part of this workload was trying to debug and understand the graph operations inside the Connected components section. The entire workload algorithm was new to me, but this section really threw me through a loop. I kept running into a strange error relating to 
