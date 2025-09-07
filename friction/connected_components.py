@@ -1,4 +1,3 @@
-import daft
 from daft import col, struct, DataFrame
 
 

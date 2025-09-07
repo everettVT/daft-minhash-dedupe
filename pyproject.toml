@@ -18,4 +18,5 @@ dependencies = [
     "hypothesis",
     "igraph>=0.11.9",
     "uuid_utils",
+    "pytest-cov>=6.3.0",
 ]

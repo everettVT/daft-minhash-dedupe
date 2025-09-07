@@ -1,8 +1,6 @@
 
 import os
 from selectolax.parser import HTMLParser
-import re
-import hashlib
 import math
 import time
 
@@ -31,7 +29,8 @@ def remove_http_headers(x: str) -> str:
 @daft.func()
 def extract_blocks(html: str) -> list[str]:
     tree = HTMLParser(html)
-    for n in tree.css("script,style,noscript"):  n.decompose()
+    for n in tree.css("script,style,noscript")
+      n.decompose()
     blocks = []
     for node in tree.css("article, main, p, h1, h2, h3, li"):
         txt = node.text(separator=" ", strip=True)

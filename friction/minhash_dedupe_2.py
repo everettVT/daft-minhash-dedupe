@@ -10,7 +10,7 @@ from daft.functions import monotonically_increasing_id
 from daft.io import IOConfig, S3Config
 
 from scipy.integrate import quad as integrate
-from connected_components import ConnectedComponents
+from .connected_components import ConnectedComponents
 
 
 from logging import getLogger, INFO
