@@ -270,15 +270,6 @@ def test_lsh_banding_properties(pipeline, data):
     banded = pipeline.lsh_banding(df, R, B)
     assert banded.count_rows() <= B
 
-
-def test_band_generation_wrapper(pipeline):
-    R, B = 2, 2
-    df = daft.from_pydict({pipeline.index_col: [1], "min_hashes": [[1,2,3,4]]})
-    banded = pipeline.band_generation(df, R, B)
-    out = banded.to_pydict()
-    assert {"node_id", "bands", "band_idx"}.issubset(set(out.keys()))
-
-
 def test_prep_node_id_index_map(pipeline):
     df = daft.from_pydict({"block_id": ["a", "b"], "min_hashes": [[1], [2]]})
     df_node, id_map = pipeline.prep_node_id_index_map(df)

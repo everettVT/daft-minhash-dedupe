@@ -260,28 +260,6 @@ class MinHashDedupePipeline:
             .groupby(col("band_idx"), col("bands"))
             .agg(col("node_id").agg_list().alias("nodes"))
         )
-
-    # Compatibility wrappers for tests -------------------------------------------
-    def band_generation(self, df: DataFrame, R: int, B: int) -> DataFrame:
-        """Generate banded MinHashes with indices (compatibility wrapper for tests)."""
-        @daft.func()
-        def get_band_idx(band: list[int], B: int) -> list[int]:
-            return list(range(min(len(band), B)))
-        return (
-            df
-            .with_column("node_id", col(self.index_col))
-            .with_column("bands", col("min_hashes").list.chunk(R))
-            .with_column("band_idx", get_band_idx(col("bands"), B))
-            .explode("bands", "band_idx")
-        )
-
-    def group_bands(self, banded: DataFrame) -> DataFrame:
-        """Group banded data by band index and hash, aggregating node lists."""
-        return (
-            banded
-            .groupby(col("band_idx"), col("bands"))
-            .agg(col("node_id").agg_list().alias("nodes"))
-        )
     
     # Connected Components ---------------------------------------------------------
     def _build_edges(self, df: DataFrame):
@@ -297,22 +275,7 @@ class MinHashDedupePipeline:
             .distinct()
             .collect()
         )
-
-    # Legacy/compat methods used by tests ---------------------------------------
-    def _generate_edges(self, grouped: DataFrame) -> DataFrame:
-        """Legacy method to generate edges from grouped nodes (for compatibility)."""
-        return (
-            grouped
-            .with_column("left_edge", col("nodes").list.min())
-            .explode("nodes")
-            .with_column("right_edge", col("nodes"))
-            .where(col("left_edge") != col("right_edge"))
-            .select("left_edge", "right_edge")
-            .collect()
-        )
     
-    
-
     def _large_star(self, edges: DataFrame) -> DataFrame:
         """Perform large-star operation: connect nodes to min in extended neighborhood."""
         # 1. Emit U,V and V,U 
@@ -552,7 +515,6 @@ class MinHashDedupePipeline:
         # Start from generated edges; drop nulls and canonicalize
         e = self._build_edges(df)
         
-
         if igraph_validate:
             ig_comps = self._igraph_connected_components(e)
 
