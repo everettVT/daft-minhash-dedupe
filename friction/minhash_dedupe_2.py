@@ -10,7 +10,7 @@ from daft.functions import monotonically_increasing_id
 from daft.io import IOConfig, S3Config
 
 from scipy.integrate import quad as integrate
-from typing import Literal
+from .connected_components import ConnectedComponents
 
 
 from logging import getLogger, INFO
@@ -71,7 +71,12 @@ def preprocess_common_crawl_html(uri: str, row_limit: int = 1000, index_col: str
     )
     return df_text
 
+def sig(df):  # stable signature
+    return set(map(tuple, df.select("u","v").to_pydict().values()))
 
+def diff(a,b):
+    A,B = sig(a), sig(b)
+    return A-B, B-A
 
 def optimal_param(
     threshold: float,
@@ -140,12 +145,6 @@ def optimal_param(
 def ee(u: Expression, v: Expression):
     return struct(u.alias("u"), v.alias("v"))
 
-def sig(df):  # stable signature
-    return set(map(tuple, df.select("u","v").to_pydict().values()))
-
-def diff(a,b):
-    A,B = sig(a), sig(b)
-    return A-B, B-A
 class MinHashDedupePipeline:
 
     def __init__(self,
@@ -163,9 +162,6 @@ class MinHashDedupePipeline:
         lowercase: bool = False,
         nfd_unicode: bool = True,
         white_space: bool = True,
-        igraph_validate: bool = False,
-        algorithm: Literal["alternating", "two_phase"] = "alternating",
-        max_loops: int = 100,
     ):
         self.output_uri = output_uri
         self.checkpoint_uri = checkpoint_uri
@@ -181,9 +177,6 @@ class MinHashDedupePipeline:
         self.lowercase = lowercase
         self.nfd_unicode = nfd_unicode
         self.white_space = white_space
-        self.igraph_validate = igraph_validate
-        self.algorithm = algorithm
-        self.max_loops = max_loops
 
         B, R = optimal_param(threshold, num_perm)
         assert B * R == num_perm, "B * R must equal num_perm"
@@ -196,8 +189,9 @@ class MinHashDedupePipeline:
         df_minh = self.minhash(df_norm, self.num_perm, self.ngram_size, self.seed, self.hash_function).collect()
         df_node, id_map = self.prep_node_id_index_map(df_minh)
         df_bands = self.lsh_banding(df_node, self.R, self.B).collect()
-        assigns = self.connected_components_2(df_bands, self.algorithm, self.max_loops, self.igraph_validate)
-        results = self.merge_results(df_prep, assigns, id_map)
+        assigns = self.connected_components_2(df_bands)
+        assigns_str = self._assignments_back_to_strings(assigns, id_map)
+        results = self.merge_results(df_prep, assigns_str)
         return results
 
         
@@ -274,26 +268,6 @@ class MinHashDedupePipeline:
             .groupby(col("band_idx"), col("bands"))
             .agg(col("node_id").agg_list().alias("nodes"))
         )
-
-    # Compatibility wrappers for tests -------------------------------------------
-    def band_generation(self, df: DataFrame, R: int, B: int) -> DataFrame:
-        @daft.func()
-        def get_band_idx(band: list[int], B: int) -> list[int]:
-            return list(range(min(len(band), B)))
-        return (
-            df
-            .with_column("node_id", col(self.index_col))
-            .with_column("bands", col("min_hashes").list.chunk(R))
-            .with_column("band_idx", get_band_idx(col("bands"), B))
-            .explode("bands", "band_idx")
-        )
-
-    def group_bands(self, banded: DataFrame) -> DataFrame:
-        return (
-            banded
-            .groupby(col("band_idx"), col("bands"))
-            .agg(col("node_id").agg_list().alias("nodes"))
-        )
     
     # Connected Components ---------------------------------------------------------
     def _build_edges(self, df: DataFrame):
@@ -309,87 +283,68 @@ class MinHashDedupePipeline:
             .collect()
         )
 
-    # Legacy/compat methods used by tests ---------------------------------------
-    def _generate_edges(self, grouped: DataFrame) -> DataFrame:
+    def _canonicalize_edges(self, df: DataFrame) -> DataFrame:
+        # Always direct from larger id -> smaller id, drop self-loops & dups
         return (
-            grouped
-            .with_column("left_edge", col("nodes").list.min())
-            .explode("nodes")
-            .with_column("right_edge", col("nodes"))
-            .where(col("left_edge") != col("right_edge"))
-            .select("left_edge", "right_edge")
+            df
+            .select((col("u") <= col("v")).if_else(ee(col("u"), col("v")), ee(col("v"), col("u"))).alias("e"))
+            .select(col("e")["*"]) 
+            .where(col("u") != col("v"))
+            .distinct()
             .collect()
         )
-    
-    
+
+    def _symmetrize(self, df: DataFrame) -> DataFrame:
+        # Make undirected by adding both directions
+        return (
+            df
+            .select("u", "v")
+            .union_all(df.select(col("v").alias("u"), col("u").alias("v")))
+            .collect()
+        )
 
     def _large_star(self, edges: DataFrame) -> DataFrame:
-        # 1. Emit U,V and V,U 
-        undirected = (
-            edges
-            .select("u", "v")
-            .union_all(edges.select(col("v").alias("u"), col("u").alias("v")))
-            .collect()
-        )
+        # Undirected neighborhood via symmetrization
+        E = self._symmetrize(edges)
 
-        # Step 2: Group by u, and aggregate the list of v's
+        # Γ(u) as list, m = min(Γ⁺(u))
         neigh = (
-            undirected
+            E
             .groupby("u").agg_list("v")
             .with_column("nbrs", col("v"))
+            .with_column("m", col("nbrs").list.min())
+            .with_column("m", (col("u") < col("m")).if_else(col("u"), col("m")))
         )
-
-        # Step 3: Compute m = min over nbrs union {u}
-        neigh = neigh.with_column("m", col("nbrs").list.min())
-        neigh = neigh.with_column(
-            "m", 
-            col("m").is_null().if_else(
-                col("u"),
-                (col("u") < col("m")).if_else(col("u"), col("m"))
-            )
-        )
+        # print("large star neigh:")
+        # neigh.show()
 
         # Emit (v, m(u)) for v > u
         out = (
             neigh.explode("nbrs")
-                .where(col("nbrs") > col("u")) 
+                .where(col("nbrs") > col("u"))
                 .select(col("nbrs").alias("u"), col("m").alias("v"))
                 .where(col("u") != col("v"))
                 .distinct()
                 .collect()
         )
-
+        # print("large star out where u != v:")
+        # out.where(col("u") != col("v")).show()
         return out
 
     def _small_star(self, edges: DataFrame) -> DataFrame:
-        # Step 1: For each edge, emit to the larger node as key, smaller as value
-        directed =  (
-            edges.select(
-                (col("u") < col("v")).if_else(
-                    ee(col("u"), col("v")), 
-                    ee(col("v"), col("u"))
-                ).alias("e"))
-            .select(col("e")["*"]) 
-            .where(col("u") != col("v"))
-            .distinct()
-        )
+        # Direct edges high -> low (canonical)
+        directed = self._canonicalize_edges(edges)
 
-        # Step 2: Group by larger u, nbrs are smaller neighbors
+        # N(u) = list of lower neighbors v (since u >= v by construction)
         neigh = (
             directed
             .groupby("u").agg_list("v")
             .with_column("nbrs", col("v"))
+            .with_column("m", col("nbrs").list.min())
+            .with_column("m", (col("u") < col("m")).if_else(col("u"), col("m")))
         )
-
-        # Step 3: Compute m = min over nbrs union {u}
-        neigh = neigh.with_column("m", col("nbrs").list.min())
-        neigh = neigh.with_column(
-            "m", 
-            col("m").is_null().if_else(
-                col("u"),
-                (col("u") < col("m")).if_else(col("u"), col("m"))
-            )
-        )
+        # print("small star neigh:")
+        # neigh.show()
 
         # Emit (v, m(u)) for all v in N(u)
         out = (
@@ -399,204 +354,23 @@ class MinHashDedupePipeline:
                 .distinct()
                 .collect()
         )
-        
+        # print("small star out where u != v:")
+        # out.where(col("u") != col("v")).show()
         return out
 
-    def canonicalize(self, edges: DataFrame) -> DataFrame:
-        return (
-            edges
-            .with_column("u_can", (col("u") < col("v")).if_else(col("u"), col("v")))
-            .with_column("v_can", (col("u") < col("v")).if_else(col("v"), col("u")))
-            .select(col("u_can").alias("u"), col("v_can").alias("v"))
-            .distinct()
-        )
-
-    def symmetrize(self, edges: DataFrame) -> DataFrame:
-        return (
-            edges
-            .select("u", "v")
-            .union_all(edges.select(col("v").alias("u"), col("u").alias("v")))
-            .collect()
-        )
-
-    def check_canonical_set_equality(self, prev_edges: DataFrame, curr_edges: DataFrame) -> bool:
-        prev_can = self.canonicalize(prev_edges).collect().to_pydict()
-        curr_can = self.canonicalize(curr_edges).collect().to_pydict()
-        prev_set = set(zip(prev_can["u"], prev_can["v"]))
-        curr_set = set(zip(curr_can["u"], curr_can["v"]))
-        return prev_set == curr_set
+    def _check_canonical_set_equality(self, a: DataFrame, b: DataFrame) -> bool:
+        ca = self._canonicalize_edges(a)
+        cb = self._canonicalize_edges(b)
+        # a \ b and b \ a both empty => equal
+        left_minus  = ca.join(cb, on=["u","v"], how="anti").count_rows()
+        right_minus = cb.join(ca, on=["u","v"], how="anti").count_rows()
+        return (left_minus == 0) and (right_minus == 0)
 
     def _pairs_equal(self, a: DataFrame, b: DataFrame) -> bool:
+        """Compare equality of pair sets over columns ["u", "rep"]."""
         left_minus  = a.join(b, on=["u","rep"], how="anti").count_rows()
         right_minus = b.join(a, on=["u","rep"], how="anti").count_rows()
         return (left_minus == 0) and (right_minus == 0)
-
-    
-
-    def construct_assignments(self, b: DataFrame) -> DataFrame:
-        """Construct assignments from the edge list b."""
-        # Build the set of all unique node IDs that appear in the edge list
-        # (both as source 'u' and destination 'v')
-        nodes = (
-            b.select(col("u").alias("u"))          # grab all source nodes
-             .union_all(b.select(col("v").alias("u")))  # grab all destination nodes
-             .distinct()                           # deduplicate to get unique nodes
-        )
-        
-        # For every node, compute the smallest node ID it is connected to
-        # (i.e., its tentative representative / root in the current component)
-        rep_map = (
-            b
-            .groupby("u")                          # group edges by source node
-            .agg(col("v").min().alias("rep"))      # find the smallest neighbor
-        )
-        
-        # Join each node with its tentative representative.
-        # Nodes that have no outgoing edges (and thus no entry in rep_map)
-        # become their own representative.
-        assignments = (
-            nodes
-            .join(rep_map, on="u", how="left")     # left join to keep all nodes
-            .with_column(
-                "rep",
-                col("rep").is_null()               # if no neighbor was found
-                .if_else(col("u"), col("rep"))     # use the node itself as rep
-            )
-            .select("u", "rep")                    # keep only node and its rep
-            .distinct()                            # deduplicate any duplicates
-            .collect()                             # materialize the result
-        )
-        return assignments
-
-    def global_min_label_propagation(self, b: DataFrame, assignments: DataFrame) -> DataFrame:
-        """
-        Propagate the global minimum label across the undirected graph until convergence.
-
-        Why this is needed:
-        - After alternating Large-/Small-Star and applying path compression, components can still
-          stabilize with multiple local minima (distinct labels) within the same true component.
-        - This deterministic min-label diffusion ensures every node in a connected component adopts
-          the single global minimum node-id as its representative, restoring exact parity to igraph.
-
-        Inputs:
-        - b: DataFrame of edges with columns ["u", "v"]. Direction does not matter here; we symmetrize.
-        - assignments: DataFrame of current labels with columns ["u", "rep"].
-
-        Algorithm:
-        1) Symmetrize edges to build an undirected adjacency (both directions present).
-        2) Initialize labels(u) from assignments.rep.
-        3) Iterate up to lp_max_iters times:
-           a) For each node, compute nbr_min(u) = min(label(v)) over neighbors v of u.
-           b) Update label(u) = min(label(u), nbr_min(u)) with null-safe handling.
-           c) Deduplicate and compare to prior labels; stop when the (u, label) pair set stabilizes.
-        4) Return labels as assignments with schema ["u", "rep"].
-
-        Complexity:
-        - Each iteration is a small number of scans and groupbys; convergence is fast in practice.
-        Determinism:
-        - Pure min-reduction yields a unique fixed point given the input edges and initial labels.
-        """
-        # Build an undirected view of the graph so labels can flow in both directions
-        E = self.symmetrize(b)
-
-        # Initialize labels from current assignments: rep becomes the working label per node
-        labels = assignments.select(col("u"), col("rep").alias("label")).collect()
-
-        lp_iters = 0
-        lp_max_iters = 100
-        while lp_iters < lp_max_iters:
-            lp_iters += 1
-
-            # For each node u, compute the minimum label among its neighbors
-            nbr_min = (
-                E
-                .join(labels, left_on="v", right_on="u", how="left")
-                .select(col("u").alias("node"), col("label"))
-                .groupby("node")
-                .agg(col("label").min().alias("nbr_min"))
-                .collect()
-            )
-
-            # Lower each node's label to min(current_label, neighbor_min_label)
-            labels_next = (
-                labels
-                .join(nbr_min, left_on="u", right_on="node", how="left")
-                .with_column(
-                    "label",
-                    col("nbr_min").is_null().if_else(
-                        col("label"),
-                        (col("label") <= col("nbr_min")).if_else(col("label"), col("nbr_min")),
-                    ),
-                )
-                .select(col("u"), col("label"))
-                .distinct()
-                .collect()
-            )
-
-            # Convergence: compare pair sets after casting back to (u, rep)
-            if self._pairs_equal(
-                assignments.select(col("u"), col("rep").alias("label")).select(col("u"), col("label").alias("rep")),
-                labels_next.select(col("u"), col("label").alias("rep")),
-            ):
-                break
-
-            # Continue iterating with updated assignments/labels
-            assignments = labels_next.select(col("u"), col("label").alias("rep")).collect()
-            labels = labels_next
-
-        return assignments
-
-    def connected_components_2(self,
-        df: DataFrame,
-        algorithm: Literal["alternating", "two_phase"] = "alternating",
-        max_loops: int = 100,
-        igraph_validate: bool = False,
-    ) -> DataFrame:
-        # Start from generated edges; drop nulls and canonicalize
-        e = self._build_edges(df)
-        
-
-        if igraph_validate:
-            ig_comps = self._igraph_connected_components(e)
-
-        b = e
-        if algorithm == "alternating":
-            for _ in range(max_loops):
-                a = self._large_star(b)
-                b_next = self._small_star(a)
-
-                if self.check_canonical_set_equality(b, b_next):
-                    b = b_next
-                    break
-                b = b_next
-
-        elif algorithm == "two_phase":
-            # Outer Loop - Repeat (large-star to fixed point) THEN one small-star
-            for _ in range(max_loops):
-                L = b
-                # Inner Loop: large-star until no change
-                for _ in range(max_loops):
-                    L_next = self._large_star(L)
-                    if self.check_canonical_set_equality(L, L_next):
-                        L = L_next
-                        break
-                    L = L_next
-
-                b_next = self._small_star(L)
-                if self.check_canonical_set_equality(b, b_next):
-                    b = b_next
-                    break
-                b = b_next
-
-        assignments = self.construct_assignments(b)
-        
-        # Ensures igraph parity 
-        assignments = self.global_min_label_propagation(b, assignments)
-        
-        if igraph_validate:
-            self._igraph_validate_assignments(assignments, ig_comps)
-
-        return assignments
 
     def _igraph_connected_components(self, df: DataFrame):
         import igraph as ig
@@ -625,10 +399,26 @@ class MinHashDedupePipeline:
         # Map back to original node IDs
         return {frozenset(node_ids[i] for i in comp) for comp in comps}
 
+    def _assignments_back_to_strings(self, assigns: DataFrame, id_map: DataFrame) -> DataFrame:
+        # assigns: [u(int64), rep(int64)] → [index_col(str), component_col(str)]
+        a1 = assigns.join(id_map.with_column_renamed(self.index_col, "__u_str"), left_on="u", right_on="node_id")
+        a2 = a1.join(id_map.with_column_renamed(self.index_col, "__rep_str"), left_on="rep", right_on="node_id")
+        return a2.select(
+            col("__u_str").alias(self.index_col),
+            col("__rep_str").alias(self.component_col)
+        ).collect()
 
-    def _igraph_validate_assignments(self, assignments: DataFrame, ig_comps: set):
+    def connected_components_2(self, df: DataFrame) -> DataFrame:
+        # Start from generated edges; drop nulls and canonicalize
+        e = self._build_edges(df)
+        b = self._canonicalize_edges(e)
+
+        cc = ConnectedComponents()
+        assignments = cc.compute_from_edges(b)
+
         # Validate assignments vs igraph components derived from the same edge set
         try:
+            ig_comps = self._igraph_connected_components(b)
             ours_grouped = (
                 assignments
                 .groupby("rep")
@@ -645,7 +435,7 @@ class MinHashDedupePipeline:
                 def _preview(sets, k=3):
                     out = []
                     for comp in list(sets)[:k]:
-                        out.append(sorted(list(int(c) for c in comp))[:10])
+                        out.append(sorted(list(comp))[:10])
                     return out
                 print(f"[VALIDATION] MISMATCH: ours={len(ours_comps)} vs igraph={len(ig_comps)}")
                 print(f"  examples only in ours: {_preview(only_ours)}")
@@ -653,36 +443,37 @@ class MinHashDedupePipeline:
         except Exception as exc:
             print(f"[VALIDATION] Skipped due to error: {exc}")
 
-    def _assignments_back_to_strings(self, assigns: DataFrame, id_map: DataFrame) -> DataFrame:
-        # assigns: [u(int64), rep(int64)] → [index_col(str), component_col(str)]
-        a1 = assigns.join(id_map.with_column_renamed(self.index_col, "__u_str"), left_on="u", right_on="node_id")
-        a2 = a1.join(id_map.with_column_renamed(self.index_col, "__rep_str"), left_on="rep", right_on="node_id")
-        return a2.select(
-            col("__u_str").alias(self.index_col),
-            col("__rep_str").alias(self.component_col)
-        )
+        return assignments
 
-    def merge_results(self, df: DataFrame, assignment: DataFrame, id_map: DataFrame):
-        # Select minimum integer representative per component
+
+    def merge_results(self, df: DataFrame, assignment: DataFrame):
+        print(f"Original df rows: {df.count_rows()}")
+        print(f"Assignment rows: {assignment.count_rows()}")
+        
         assignment_unique = (
             assignment
-            .groupby("u")
-            .agg(col("rep").min())
+            .select(col(self.index_col), col(self.component_col))
+            .groupby(self.index_col)
+            .agg(col(self.component_col).min().alias(self.component_col))
         )
-        # Map integer representatives back to original string indices
-        assignments_unique_str = self._assignments_back_to_strings(assignment_unique, id_map)
-
-        # Join back to original df and filter to keep only rows where the row is its own representative or isolated
-        df_joined = df.join(assignments_unique_str, on=self.index_col, how="left")
+        print(f"Assignment unique rows: {assignment_unique.count_rows()}")
         
-        return (
-            df_joined
-            .filter(
-                col(self.component_col).is_null() | 
-                (col(self.component_col) == col(self.index_col))
-            )
-            .exclude(self.component_col)
-        )
+        df_joined = df.join(assignment_unique, on=self.index_col, how="left")
+        print(f"After join rows: {df_joined.count_rows()}")
+        
+        # Check how many have assignments vs nulls
+        assigned_count = df_joined.filter(~col(self.component_col).is_null()).count_rows()
+        null_count = df_joined.filter(col(self.component_col).is_null()).count_rows()
+        print(f"Assigned: {assigned_count}, Null: {null_count}")
+        
+        # Check how many are representatives
+        rep_count = df_joined.filter(col(self.component_col) == col(self.index_col)).count_rows()
+        print(f"Representatives: {rep_count}")
+        
+        return df_joined.filter(
+            col(self.component_col).is_null() | 
+            (col(self.component_col) == col(self.index_col))
+        ).exclude(self.component_col)
     
 
 def partitioned_save(output_uri: str, df: DataFrame, chunk_size: int, max_partitions: int):
@@ -698,7 +489,7 @@ def partitioned_save(output_uri: str, df: DataFrame, chunk_size: int, max_partit
             .write_parquet(output_uri, partition_cols=["__pid__"], write_mode="overwrite", compression="snappy")
         )
     else:
-        df.write_parquet(output_uri, compression="snappy")
+        df = df.write_parquet(output_uri, compression="snappy")
 
     end_time = time.time()
     print(f"Partitioned Saved {total_rows} rows in {end_time - start_time:.2f}s")
@@ -730,7 +521,7 @@ if __name__ == "__main__":
     # %% Define Parameters
     cc_segment = "CC-MAIN-2024-42"
     data_uri = WORKDIR / "data" # For local testing, replace with s3 uri for cloud
-    ROW_LIMIT = 100000
+    ROW_LIMIT = 50000
     OUTPUT_URI = data_uri / "output"
     CHECKPOINT_URI = data_uri / "checkpoint"
 
@@ -768,9 +559,6 @@ if __name__ == "__main__":
         lowercase = lowercase,
         nfd_unicode = nfd_unicode,
         white_space = white_space,
-        igraph_validate = True,
-        algorithm = "two_phase",
-        max_loops = 100,
     )
 
 
