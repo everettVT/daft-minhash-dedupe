@@ -21,6 +21,7 @@ logger.setLevel(INFO)
 
 @daft.func()
 def remove_http_headers(x: str) -> str:
+    """Remove HTTP headers from input string by splitting on double CRLF, returning the body or empty string."""
     if x is None:
         return ""
     if len(x.split("\r\n\r\n")) > 1:
@@ -29,6 +30,7 @@ def remove_http_headers(x: str) -> str:
 
 @daft.func()
 def extract_blocks(html: str) -> list[str]:
+    """Parse HTML using Selectolax, remove scripts/styles/noscripts, extract text blocks from key tags."""
     tree = HTMLParser(html)
     for n in tree.css("script,style,noscript"):
         n.decompose()
@@ -42,9 +44,11 @@ def extract_blocks(html: str) -> list[str]:
 
 @daft.func()
 def get_block_idx(blocks: list[str]) -> list[int]:
+    """Generate integer indices for each element in the input list of blocks."""
     return list(range(len(blocks)))
 
-def preprocess_common_crawl_html(uri: str, row_limit: int = 1000, index_col: str = "block_id", content_col: str = "block_text"):
+def preprocess_common_crawl_html(uri: str, row_limit: int = 1000, index_col: str = "block_id", content_col: str = "block_text"):  # pragma: no cover
+    """Preprocess Common Crawl WARC records: filter HTML, remove headers, extract text blocks, add unique IDs. Returns Daft DataFrame with index and content columns."""
     df_warc = daft.read_warc(uri).limit(row_limit)
 
     df_html = (
@@ -79,32 +83,7 @@ def optimal_param(
     false_positive_weight: float = 0.5,
     false_negative_weight: float = 0.5,
 ):
-    """
-    Compute the optimal `MinHashLSH` parameter that minimizes the weighted sum
-    of probabilities of false positive and false negative, taken from datasketch.
-
-    Parameters
-    ----------
-    threshold : float
-        The threshold for similarity.
-    num_perm : int
-        The number of permutations.
-    false_positive_weight : float
-        The weight of false positive.
-    false_negative_weight : float
-        The weight of false negative.
-
-    Returns
-    -------
-    Tuple[int, int]
-        The optimal `b` and `r` parameters.
-        The number of bands, and the number of rows per band respectively.
-
-    Examples
-    --------
-    >>> optimal_param(0.7, 256)
-    (25, 10)
-    """
+    """Compute optimal LSH bands (b) and rows (r) minimizing weighted FP/FN for given threshold and permutations. Returns (b, r) tuple."""
 
     def false_positive_area(threshold: float, b: int, r: int):
         """Source: `datasketch.lsh`"""
@@ -138,12 +117,15 @@ def optimal_param(
     return opt
 
 def ee(u: Expression, v: Expression):
+    """Create a struct Expression with fields 'u' and 'v' for representing edges."""
     return struct(u.alias("u"), v.alias("v"))
 
 def sig(df):  # stable signature
+    """Convert DataFrame of u,v columns to a set of (u,v) tuples for stable signature comparison."""
     return set(map(tuple, df.select("u","v").to_pydict().values()))
 
 def diff(a,b):
+    """Compute set differences between signatures of two DataFrames: returns (A-B, B-A)."""
     A,B = sig(a), sig(b)
     return A-B, B-A
 class MinHashDedupePipeline:
@@ -167,6 +149,7 @@ class MinHashDedupePipeline:
         algorithm: Literal["alternating", "two_phase"] = "alternating",
         max_loops: int = 100,
     ):
+        """Initialize the MinHash deduplication pipeline with configuration for text processing, LSH, and connected components."""
         self.output_uri = output_uri
         self.checkpoint_uri = checkpoint_uri
         self.index_col = index_col
@@ -191,6 +174,7 @@ class MinHashDedupePipeline:
         self.R = R
 
     def __call__(self, input: DataFrame):
+        """Execute the full deduplication pipeline on the input DataFrame, returning deduplicated results."""
         df_prep = self.prep(input).collect()
         df_norm = self.normalize(df_prep, self.remove_punct, self.lowercase, self.nfd_unicode, self.white_space)
         df_minh = self.minhash(df_norm, self.num_perm, self.ngram_size, self.seed, self.hash_function).collect()
@@ -200,12 +184,10 @@ class MinHashDedupePipeline:
         results = self.merge_results(df_prep, assigns, id_map)
         return results
 
-        
-
-
+    
     # Prepare --------------------------------------------------------------------
     def prep(self, df: DataFrame):
-        "Drop Un-needed Columns and add an integer surrogate for index_col"
+        """Prepare input DataFrame by selecting index and content columns for downstream processing."""
         return (
             df
             .select(self.index_col, self.content_col)
@@ -219,6 +201,7 @@ class MinHashDedupePipeline:
         nfd_unicode: bool = True,
         white_space: bool = True,
     ) -> DataFrame:
+        """Apply text normalization to content column with optional flags for punctuation, case, Unicode, and whitespace."""
         return (
             df
             .with_column("content_normalized", 
@@ -239,6 +222,7 @@ class MinHashDedupePipeline:
         seed: int = 42, 
         hash_function: str = 'xxhash',
     ) -> DataFrame:
+        """Compute MinHash signatures on normalized content using specified parameters."""
         # Add monotonically increasing id, and generate minhashes
         return (
             df
@@ -255,6 +239,7 @@ class MinHashDedupePipeline:
         )
 
     def prep_node_id_index_map(self, df: DataFrame):
+        """Add integer node IDs to DataFrame and create mapping back to original string indices."""
         # Add integer index surrogate
         df = df.with_column("node_id", monotonically_increasing_id())
         id_map = df.select(self.index_col, "node_id").distinct()
@@ -262,6 +247,7 @@ class MinHashDedupePipeline:
 
     
     def lsh_banding(self, df: DataFrame, R: int, B: int):
+        """Band MinHash signatures and group nodes by band index and hash for candidate pairs."""
         @daft.func()
         def get_band_idx(band: list[int], B: int) -> list[int]:
             return list(range(min(len(band), B)))
@@ -277,6 +263,7 @@ class MinHashDedupePipeline:
 
     # Compatibility wrappers for tests -------------------------------------------
     def band_generation(self, df: DataFrame, R: int, B: int) -> DataFrame:
+        """Generate banded MinHashes with indices (compatibility wrapper for tests)."""
         @daft.func()
         def get_band_idx(band: list[int], B: int) -> list[int]:
             return list(range(min(len(band), B)))
@@ -289,6 +276,7 @@ class MinHashDedupePipeline:
         )
 
     def group_bands(self, banded: DataFrame) -> DataFrame:
+        """Group banded data by band index and hash, aggregating node lists."""
         return (
             banded
             .groupby(col("band_idx"), col("bands"))
@@ -297,6 +285,7 @@ class MinHashDedupePipeline:
     
     # Connected Components ---------------------------------------------------------
     def _build_edges(self, df: DataFrame):
+        """Build edge list from grouped nodes by connecting each to the minimum in group."""
         return (
             df
             .with_column("u", col("nodes").list.min())
@@ -311,6 +300,7 @@ class MinHashDedupePipeline:
 
     # Legacy/compat methods used by tests ---------------------------------------
     def _generate_edges(self, grouped: DataFrame) -> DataFrame:
+        """Legacy method to generate edges from grouped nodes (for compatibility)."""
         return (
             grouped
             .with_column("left_edge", col("nodes").list.min())
@@ -324,6 +314,7 @@ class MinHashDedupePipeline:
     
 
     def _large_star(self, edges: DataFrame) -> DataFrame:
+        """Perform large-star operation: connect nodes to min in extended neighborhood."""
         # 1. Emit U,V and V,U 
         undirected = (
             edges
@@ -349,7 +340,7 @@ class MinHashDedupePipeline:
             )
         )
 
-        # Emit (v, m(u)) for v > u
+        # Step 4: Emit (v, m(u)) for v > u
         out = (
             neigh.explode("nbrs")
                 .where(col("nbrs") > col("u")) 
@@ -362,6 +353,7 @@ class MinHashDedupePipeline:
         return out
 
     def _small_star(self, edges: DataFrame) -> DataFrame:
+        """Perform small-star operation: connect to min in direct smaller neighborhood."""
         # Step 1: For each edge, emit to the larger node as key, smaller as value
         directed =  (
             edges.select(
@@ -403,6 +395,7 @@ class MinHashDedupePipeline:
         return out
 
     def canonicalize(self, edges: DataFrame) -> DataFrame:
+        """Order edges so u < v and deduplicate for canonical representation."""
         return (
             edges
             .with_column("u_can", (col("u") < col("v")).if_else(col("u"), col("v")))
@@ -412,6 +405,7 @@ class MinHashDedupePipeline:
         )
 
     def symmetrize(self, edges: DataFrame) -> DataFrame:
+        """Make edge list undirected by adding reverse edges."""
         return (
             edges
             .select("u", "v")
@@ -420,21 +414,16 @@ class MinHashDedupePipeline:
         )
 
     def check_canonical_set_equality(self, prev_edges: DataFrame, curr_edges: DataFrame) -> bool:
+        """Check if two edge DataFrames represent the same set after canonicalization."""
         prev_can = self.canonicalize(prev_edges).collect().to_pydict()
         curr_can = self.canonicalize(curr_edges).collect().to_pydict()
         prev_set = set(zip(prev_can["u"], prev_can["v"]))
         curr_set = set(zip(curr_can["u"], curr_can["v"]))
         return prev_set == curr_set
 
-    def _pairs_equal(self, a: DataFrame, b: DataFrame) -> bool:
-        left_minus  = a.join(b, on=["u","rep"], how="anti").count_rows()
-        right_minus = b.join(a, on=["u","rep"], how="anti").count_rows()
-        return (left_minus == 0) and (right_minus == 0)
-
     
-
     def construct_assignments(self, b: DataFrame) -> DataFrame:
-        """Construct assignments from the edge list b."""
+        """Build node-to-representative assignments from edge list, using min neighbor."""
         # Build the set of all unique node IDs that appear in the edge list
         # (both as source 'u' and destination 'v')
         nodes = (
@@ -468,7 +457,14 @@ class MinHashDedupePipeline:
         )
         return assignments
 
+    def _pairs_equal(self, a: DataFrame, b: DataFrame) -> bool:
+        """Check if two DataFrames have identical (u, rep) pairs via anti-joins."""
+        left_minus  = a.join(b, on=["u","rep"], how="anti").count_rows()
+        right_minus = b.join(a, on=["u","rep"], how="anti").count_rows()
+        return (left_minus == 0) and (right_minus == 0)
+
     def global_min_label_propagation(self, b: DataFrame, assignments: DataFrame) -> DataFrame:
+        """Propagate global minimum labels across components until convergence for consistency."""
         """
         Propagate the global minimum label across the undirected graph until convergence.
 
@@ -552,6 +548,7 @@ class MinHashDedupePipeline:
         max_loops: int = 100,
         igraph_validate: bool = False,
     ) -> DataFrame:
+        """Compute connected components using star operations, propagation, and optional igraph validation."""
         # Start from generated edges; drop nulls and canonicalize
         e = self._build_edges(df)
         
@@ -598,7 +595,8 @@ class MinHashDedupePipeline:
 
         return assignments
 
-    def _igraph_connected_components(self, df: DataFrame):
+    def _igraph_connected_components(self, df: DataFrame):  # pragma: no cover
+        """Compute connected components using igraph library for validation purposes."""
         import igraph as ig
         import pandas as pd
         # Ensure integer dtype and materialize edges
@@ -626,7 +624,8 @@ class MinHashDedupePipeline:
         return {frozenset(node_ids[i] for i in comp) for comp in comps}
 
 
-    def _igraph_validate_assignments(self, assignments: DataFrame, ig_comps: set):
+    def _igraph_validate_assignments(self, assignments: DataFrame, ig_comps: set):  # pragma: no cover
+        """Validate computed assignments against igraph components, logging mismatches."""
         # Validate assignments vs igraph components derived from the same edge set
         try:
             ours_grouped = (
@@ -654,6 +653,7 @@ class MinHashDedupePipeline:
             print(f"[VALIDATION] Skipped due to error: {exc}")
 
     def _assignments_back_to_strings(self, assigns: DataFrame, id_map: DataFrame) -> DataFrame:
+        """Map integer node assignments back to original string index values."""
         # assigns: [u(int64), rep(int64)] → [index_col(str), component_col(str)]
         a1 = assigns.join(id_map.with_column_renamed(self.index_col, "__u_str"), left_on="u", right_on="node_id")
         a2 = a1.join(id_map.with_column_renamed(self.index_col, "__rep_str"), left_on="rep", right_on="node_id")
@@ -663,6 +663,7 @@ class MinHashDedupePipeline:
         )
 
     def merge_results(self, df: DataFrame, assignment: DataFrame, id_map: DataFrame):
+        """Merge assignments with original DataFrame, filtering to unique representatives per component."""
         # Select minimum integer representative per component
         assignment_unique = (
             assignment
@@ -686,10 +687,17 @@ class MinHashDedupePipeline:
     
 
 def partitioned_save(output_uri: str, df: DataFrame, chunk_size: int, max_partitions: int):
+    """Save DataFrame to partitioned Parquet, using Ray for repartitioning if available."""
     start_time = time.time()
     total_rows = df.count_rows()
     
-    if ray.is_initialized():
+    # Import ray lazily so environments without ray can still use the fallback path
+    try:
+        import ray  # type: ignore
+    except Exception:
+        ray = None  # type: ignore
+
+    if (ray is not None) and getattr(ray, "is_initialized", lambda: False)():
         
         partitions = max(256, min(math.ceil(total_rows / chunk_size), max_partitions))
         df = (
@@ -704,11 +712,10 @@ def partitioned_save(output_uri: str, df: DataFrame, chunk_size: int, max_partit
     print(f"Partitioned Saved {total_rows} rows in {end_time - start_time:.2f}s")
     return df
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     # %% Import Libraries, Auth 
     import daft
     from daft.io import IOConfig, S3Config
-    import ray
     import pathlib
     from dotenv import load_dotenv
 
