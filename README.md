@@ -2,7 +2,7 @@
 
 # Daft Minhash Deduplication
 
-* Canonical Multimodal Workload Sandbox for Minhash Deduplication on Common Crawl HTML Documents using Daft Dataframes *
+Canonical Multimodal Workload Sandbox for Minhash Deduplication on Common Crawl HTML Documents using Daft Dataframes
 
 </div>
 
