@@ -4,7 +4,7 @@ import math
 from daft import lit, DataFrame
 from daft.functions import monotonically_increasing_id
 from scipy.integrate import quad as integrate
-
+import ray
 
 def optimal_param(
     threshold: float,
@@ -71,39 +71,7 @@ def optimal_param(
     return opt
 
 
-def checkpoint(checkpoint_uri: str, df: daft.DataFrame, stage: str, persist_checkpoint: bool = True):
-        uri = f"{checkpoint_uri}/{stage}"
-        start = time.time()
-        if persist_checkpoint:
-            df.write_parquet(uri)
-        else:
-            df.collect()
-            print(f"Checkpoint {stage} saved")
-            df.show()
-        end = time.time()
-        print(f"Finished {stage} stage in {end-start} sec")
-        
-        # Read Saved Checkpoint if needed
-        if persist_checkpoint:
-            df = daft.read_parquet(uri)
-        
-        return df
-
-
-def partitioned_save(output_uri: str, df: DataFrame, chunk_size: int, max_partitions: int):
-    start_time = time.time()
-    df = df.collect()
-    total_rows = df.count_rows()
-    partitions = max(256, min(math.ceil(total_rows / chunk_size), max_partitions))
-
-    (
-        df.repartition(partitions)
-        .with_column("__pid__", monotonically_increasing_id() / lit(2**36))
-        .write_parquet(output_uri, partition_cols=["__pid__"], write_mode="overwrite", compression="snappy")
-    )
-
-    end_time = time.time()
-    print(f"Partitioned Saved {total_rows} rows in {end_time - start_time:.2f}s")
+d
 
 def log_results(output_uri: str, prepped: DataFrame, results: DataFrame, start_time: float, end_time: float):
     prepped_rows = prepped.count_rows()

@@ -116,62 +116,8 @@ class MinHashDedupePipeline:
         assert B * R == num_perm, "B * R must equal num_perm"
         self.B = B
         self.R = R
-
-    def run(self,
-        cc_warc_uri: str,
-        row_limit: int = 1000,
-        checkpoints_active = True,
-
-    ):
         
-        start_time = time.time()
-        
-
-        # Stage 1: Preprocess HTML to extract text
-        df_raw = self.load_data(cc_warc_uri, row_limit)
-        df_prepped = self.preprocess(df_raw)
-
-        df_prepped = checkpoint(self.checkpoint_uri, df_prepped, "prepped", checkpoints_active)
-
-        # Stage 2: Normalize Text, MinHash, and Band Generation
-        df_norm    = self.normalize(df_prepped, self.remove_punct, self.lowercase, self.nfd_unicode, self.white_space)
-        df_minhash = self.minhash(df_norm, self.num_perm, self.ngram_size, self.seed, self.hash_function)
-        df_band    = self.band_generation(df_minhash, self.R, self.B)
-        df_grouped = self.group_bands(df_band)
-
-        df_grouped = checkpoint(self.checkpoint_uri, df_grouped, "bands", checkpoints_active)
-        
-        # Stage 3: Connected Components 
-        df_edges = self._generate_edges(df_grouped)
-        df_edges = checkpoint(self.checkpoint_uri, df_edges, "edges", checkpoints_active)
-
-
-        df_assignments2 = self.connected_components_2(df_edges)
-        df_assignments2 = checkpoint(self.checkpoint_uri, df_assignments2, "assignments2", checkpoints_active)
-        df_assignments2.show()
-
-
-
-
-
-        df_assignments = self.connected_components(df_edges)
-        df_assignments = checkpoint(self.checkpoint_uri, df_assignments, "assignments", checkpoints_active)
-        df_assignments.show()
-
-
-
-
-
-        # Stage 4: Merge Results
-        df_results = self.merge_results(df_prepped, df_assignments)
-        df_results = checkpoint(self.checkpoint_uri, df_results, "results", checkpoints_active)
-
-        # Stage 5: Write Results
-        end_time = time.time()
-        self.log_results(df_prepped, df_results, start_time, end_time)
-        self.partitioned_save(df_results, chunk_size, max_partitions)
-
-        return df_results    
+  
 
     # Load Data ------------------------------------------------------------------
     def load_data(self, uri: str, row_limit: int = 1000):
@@ -533,11 +479,45 @@ class MinHashDedupePipeline:
         return df
     
 
+def partitioned_save(output_uri: str, df: DataFrame, chunk_size: int, max_partitions: int):
+    start_time = time.time()
+    df = df.collect()
+    total_rows = df.count_rows()
+    partitions = max(256, min(math.ceil(total_rows / chunk_size), max_partitions))
+    if ray.is_initialized():
+        partitioned_save(df_prepped, save_uri, chunk_size, max_partitions)
+    else:
+        df_prepped = df_prepped.write_parquet(save_uri+ "/prepped", compression="snappy")
 
+    df_mat = (
+        df.repartition(partitions)
+        .with_column("__pid__", monotonically_increasing_id() / lit(2**36))
+        .write_parquet(output_uri, partition_cols=["__pid__"], write_mode="overwrite", compression="snappy")
+    )
 
+    end_time = time.time()
+    print(f"Partitioned Saved {total_rows} rows in {end_time - start_time:.2f}s")
+    return df_mat
+
+def checkpoint(df: daft.DataFrame, uri: str, stage: str, chunk_size: int, max_partitions: int):
+        cp_uri = f"{uri}/{stage}"
+
+        if ray.is_initialized():
+            df_mat = partitioned_save(cp_uri, df, chunk_size, max_partitions)
+        else: 
+            df_mat = df.write_parquet(cp_uri)
+        
+
+        
+        # Read Saved Checkpoint if needed
+        if persist_checkpoint:
+            df = daft.read_parquet(uri)
+        
+        return df_mat
 
 
 if __name__ == "__main__":
+    # %% Import Libraries, Auth 
     import ray
     import pathlib
     from dotenv import load_dotenv
@@ -557,12 +537,10 @@ if __name__ == "__main__":
     IO_CONFIG = IOConfig(s3=s3_config)
     daft.set_planning_config(default_io_config=IO_CONFIG)
 
-    # Define Parameters
+    # %% Define Parameters
     cc_segment = "CC-MAIN-2024-42"
     save_uri = WORKDIR / "data" # For local testing, replace with s3 uri for cloud
     ROW_LIMIT = 500
-    
-    
 
     # MinHash Parameters
     num_perm = 64
@@ -582,9 +560,29 @@ if __name__ == "__main__":
     max_partitions = 2048
     persist_checkpoint = True
 
+    # %% Initialize Dedupe Pipeline
+    pipeline = MinHashDedupePipeline(
+        output_uri=save_uri + "/output",
+        checkpoint_uri=save_uri + "/checkpoint",
+        index_col="block_id",
+        content_col="block_text",
+        component_col="component",
+        num_perm = num_perm,
+        ngram_size = ngram_size,
+        threshold = threshold,
+        seed = seed,
+        hash_function = hash_function,
+        remove_punct = remove_punct,
+        lowercase = lowercase,
+        nfd_unicode = nfd_unicode,
+        white_space = white_space,
+    )
+
 
     # PIPELINE -------------------------------------------------------------
-    # Preprocess Common Crawl HTML and Persist
+    
+    # %% Preprocess Common Crawl HTML and Persist
+    start_time = time.time()
     df_prepped = preprocess_common_crawl_html(
         uri=f"s3://commoncrawl/crawl-data/{cc_segment}/segments/*/warc/*.warc.gz",
         row_limit=ROW_LIMIT,
@@ -593,30 +591,38 @@ if __name__ == "__main__":
         component_col="component",
     )
 
-    if ray.is_initialized():
-        partitioned_save(df_prepped, save_uri, chunk_size, max_partitions)
-    else:
-        df_prepped = df_prepped.write_parquet(save_uri+ "/prepped", compression="snappy")
+    # df_prepped = checkpoint()
 
-    # Run it
-    mh_pipeline= MinHashDedupePipeline(
-        output_uri=save_uri + "/output",
-        checkpoint_uri=save_uri + "/checkpoint",
-        index_col="block_id",
-        content_col="block_text",
-        component_col="component",
-    )
-    results = mh_pipeline.run(
-        prepped_uri=save_uri + "/prepped",
 
-        checkpoints_active=persist_checkpoint,
-        remove_punct=remove_punct,
-        lowercase=lowercase,
-        nfd_unicode=nfd_unicode,   
-        white_space=white_space,
-        num_perm=num_perm,
-        ngram_size=ngram_size,   
-        seed=seed,
-        hash_function=hash_function,
-        threshold=threshold,
-    )
+    # Stage 2: Normalize Text, MinHash, and Band Generation
+    df_norm    = pipeline.normalize(df_prepped, remove_punct, lowercase, nfd_unicode, white_space)
+    df_minhash = pipeline.minhash(df_norm, num_perm, ngram_size, seed, hash_function)
+    df_band    = pipeline.band_generation(df_minhash, R, B)
+    df_grouped = pipeline.group_bands(df_band)
+
+    # Stage 3: Connected Components 
+    df_assignments2 = connected_components_2(df_edges)
+    df_assignments2 = checkpoint(checkpoint_uri, df_assignments2, "assignments2", checkpoints_active)
+    df_assignments2.show()
+
+
+
+
+
+    df_assignments = connected_components(df_edges)
+    df_assignments = checkpoint(checkpoint_uri, df_assignments, "assignments", checkpoints_active)
+    df_assignments.show()
+
+
+
+
+
+    # Stage 4: Merge Results
+    df_results = merge_results(df_prepped, df_assignments)
+    df_results = checkpoint(checkpoint_uri, df_results, "results", checkpoints_active)
+
+    # Stage 5: Write Results
+    end_time = time.time()
+    log_results(df_prepped, df_results, start_time, end_time)
+    partitioned_save(df_results, chunk_size, max_partitions)
+
