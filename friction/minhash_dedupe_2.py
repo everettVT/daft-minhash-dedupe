@@ -13,12 +13,6 @@ from scipy.integrate import quad as integrate
 from .connected_components import ConnectedComponents
 
 
-from logging import getLogger, INFO
-
-logger = getLogger(__name__)
-logger.setLevel(INFO)
-
-
 @daft.func()
 def remove_http_headers(x: str) -> str:
     if x is None:
