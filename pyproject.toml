@@ -1,7 +1,7 @@
 [project]
 name = "daft-minhash-dedupe"
 version = "0.1.0"
-description = "Minhash Deduplication Workload over Common Crawl Dataset with Daft"
+description = "Minhash Deduplication Workload over Common Crawl Dataset with daft"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

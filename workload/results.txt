@@ -1,0 +1,56 @@
+[VALIDATION] PASSED: components match igraph (n=796778)
+────────────────────────────────────────────────────────────────────────────────
+# of rows before:  5348423
+# of rows after:   1829206
+% of rows kept:    34.20%
+Output Directory:  ommitted
+Overall Time:      314.48s
+
+
+[VALIDATION] PASSED: components match igraph (n=4991)
+────────────────────────────────────────────────────────────────────────────────
+# of rows before:  30439
+# of rows after:   16522
+% of rows kept:    54.28%
+Output Directory:  /Users/everett-founder/git/ugh/daft-minhash-dedupe/workload/data/output
+Overall Time:      15.84s
+
+[VALIDATION] PASSED: components match igraph (n=781998)
+────────────────────────────────────────────────────────────────────────────────
+# of rows before:  4944669
+# of rows after:   1855814
+% of rows kept:    37.53%
+Output Directory:  /Users/everett-founder/git/ugh/daft-minhash-dedupe/workload/data/output
+Overall Time:      222.21s
+
+[VALIDATION] PASSED: components match igraph (n=3465)
+────────────────────────────────────────────────────────────────────────────────
+# of rows before:  22071
+# of rows after:   11820
+% of rows kept:    53.55%
+Output Directory:  /Users/everett-founder/git/ugh/daft-minhash-dedupe/workload/data/output
+Overall Time:      10.72s
+
+[VALIDATION] PASSED: components match igraph (n=4958)
+────────────────────────────────────────────────────────────────────────────────
+# of rows before:  33749
+# of rows after:   19814
+% of rows kept:    58.71%
+Output Directory:  /Users/everett-founder/git/ugh/daft-minhash-dedupe/workload/data/output
+Overall Time:      13.94s
+
+[VALIDATION] PASSED: components match igraph (n=4646)
+────────────────────────────────────────────────────────────────────────────────
+# of rows before:  25428
+# of rows after:   12997
+% of rows kept:    51.11%
+Output Directory:  /Users/everett-founder/git/ugh/daft-minhash-dedupe/workload/data/output
+Overall Time:      12.59s
+
+[VALIDATION] PASSED: components match igraph (n=7919)
+────────────────────────────────────────────────────────────────────────────────
+# of rows before:  46851
+# of rows after:   23300
+% of rows kept:    49.73%
+Output Directory:  /Users/everett-founder/git/ugh/daft-minhash-dedupe/workload/data/output
+Overall Time:      19.00s

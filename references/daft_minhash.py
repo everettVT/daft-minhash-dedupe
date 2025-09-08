@@ -184,7 +184,7 @@ if __name__ == "__main__":
     DEFAULT_INDEX = "__id__"
 
     # region: Argument Parsing
-    parser = argparse.ArgumentParser(description="Intra-dataset near-deduplicating with Daft")
+    parser = argparse.ArgumentParser(description="Intra-dataset near-deduplicating with daft")
     parser.add_argument("--input", "-i", type=str, required=True, help="Input directory of Parquet files")
     parser.add_argument("--output", "-o", type=str, required=True, help="Output directory of Parquet files")
 

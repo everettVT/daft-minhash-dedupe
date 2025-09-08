@@ -48,7 +48,7 @@ def get_block_idx(blocks: list[str]) -> list[int]:
     return list(range(len(blocks)))
 
 def preprocess_common_crawl_html(uri: str, row_limit: int = 1000, index_col: str = "block_id", content_col: str = "block_text"):  # pragma: no cover
-    """Preprocess Common Crawl WARC records: filter HTML, remove headers, extract text blocks, add unique IDs. Returns Daft DataFrame with index and content columns."""
+    """Preprocess Common Crawl WARC records: filter HTML, remove headers, extract text blocks, add unique IDs. Returns daft DataFrame with index and content columns."""
     df_warc = daft.read_warc(uri).limit(row_limit)
 
     df_html = (
@@ -698,7 +698,7 @@ if __name__ == "__main__":  # pragma: no cover
     # %% Define Parameters
     cc_segment = "CC-MAIN-2024-42"
     data_uri = WORKDIR / "data" # For local testing, replace with s3 uri for cloud
-    ROW_LIMIT = 100000
+    ROW_LIMIT = 100
     OUTPUT_URI = data_uri / "output"
     CHECKPOINT_URI = data_uri / "checkpoint"
 
