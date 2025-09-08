@@ -9,11 +9,24 @@
   
 ## Summary
 
+I had a pretty positive experience using daft for this workload. Daft was definitely more empowering than detracting across several key areas. Obviosuly it makes sense that I'd write custom UDFs for parsing html and preprocessing the warc payloads, but even that felt like a breeze. I then quickly found the text normalization and minhash expressions which made the next two steps of the pipeline fully trivial. I didn't need to know what I was doing, I just ran the transformation and everything worked! Once I got LSH banding I asked GPT-5 to build the next steps and it achieved it within a few tries. I got to this step within the first day which made me feel a little bit like superman, especially since this was the first time I had ever been introduced to the Minhash Deduplication Workload.
+
+It was around this time that I got the reference script from the team and began adjusting my approach to match. You can see how my unfiltered notebook kind of abrubtly ends around connected components since I had been developing in the notebook to start and had begun to translate the script. I was able to run everything up until the large star algorithm which threw an exception for a small bug referencing the wrong column, but since I was still naive to what I was really changing I then transitioned to interactive debugging in a script. Little did I know just how many rabbit holes I was about to go down.
+
+For the next several days I debugged trying the existing approach. At first I was just trying to get the connected components section to run, referencing the provided script as well as the pyspark implementation. Eventually able to get the workload running, but it yielded no duplicates. Then I was able to yield duplicates, but the number of rows grew in size, now diminished. Finally I was seeing the results I was expecting but I was unable to validate them against igraph. I knew somewhere along the way I had improperly implemented the Large and Small star trasnformations and was having a difficult time interpreting where I had gone wrong. All of this was due to my own misunderstanding of the workload, and less so with Daft. Daft had all the core primatives that I needed. I just needed to translate the theory into practice. Eventualy I had to start from first principles and break down the operations step by step.
+
+At this point, the work had bled into the weekend and I was desperate for an answer. It was late into the morning when I decided to leverage an AI agent to help me achieve parity with iGraph. The [explanation from GPT-5](/friction/connected_components_reasoning.md) details what it found in the moment. In the end, it was this breakthrough that helped me complete the worklaod and validate my results. 
+
+I tested multiple orders of maginitude of documents locally 
 
 ## Context
 
+The 
+
 ## Friction Points
-The [unfiltered notebook](daft-minhash-dedupe/friction/UNFILTERED_minhash_dedupe_common_crawl.ipynb) captures my experience end-to-end building the workload up until I began debugging connected components. Some of my pain points were there, but I had to move into python scripts with a live debugger to figure it out. 
+The [unfiltered notebook](daft-minhash-dedupe/friction/UNFILTERED_minhash_dedupe_common_crawl.ipynb) captures my experience end-to-end building the workload up until I began debugging connected components. I
+
+1. 
 
 
 ### Wildcard usage patterns and the hot pink accent color
@@ -52,13 +65,11 @@ When I initially announced success, I had done so prematurely. I had only been a
 
 First thing I want to say is that for anyone who is new to minhash dedupe, the algorithm itself has a lot of new vocabulary...
 
-i am coming back to this raw take after having spent all weekend trying to get connected components to achieve parity with igraph... and i finally got it. i am exhausted... but i learned a ton.
+i am coming back to this raw take after having spent all weekend trying to get connected components to achieve parity with igraph... and i finally got it. i am exhausted... but i learned a ton. can't even capitalize my letters. 
 
-this is a seminal workload in distributed computing and I think the hardest part of all of this was just not really knowing what I was fiddling with. I had to work with GPT-5 and Grok-4 in order to figure out where my bugs where and they were super nuanced.
+This is a seminal workload in distributed computing and I think the hardest part of all of this was just not really knowing what I was fiddling with. I had to work with GPT-5 and Grok-4 in order to figure out where my bugs where and they were super nuanced.
 
-I honestly can't even begin to explain just how many iterations I tried, but in the end I had to diverge from the provided example just to get both large and small star working. Then even after I did that, remapped the integer labels back to the warc-record block ids, i was still seeing small differences between igraph results and my final assignments. They were usually on the order of like 0.001 % of the edges, but since I could work up the scale, I eventually had gpt-5 autonomously identify a solution.
-
-Having igraph as a reference was huge. NetworkX is the canonical reference for python, but its probably 20x slower. However the igraph devs built their C code has certainly paid dividends, and now those dividends are being passed on to daft!
+I honestly can't even begin to explain just how many iterations I tried, but in the end I had to diverge from the provided reference just to get both large and small star working. Then even after I did that, remapped the integer labels back to the warc-record block ids, i was still seeing small differences between igraph results and my final assignments. They were usually on the order of like 0.001 % of the edges, but since I could work up the scale, I eventually had gpt-5 autonomously identify a solution. Having igraph as a reference was huge. NetworkX is the canonical reference for python, but its probably 20x slower. (iGraph's core is written in C)
 
 You'll find an additional step in my implementation of connected components called `global_min_label_propagation` which has a detailed docstring and comments on how it works. If you look at the operations closely, the `group_by` and neighbor minimization appear extremely similar to the small star operation, but with an important difference. The `edges.join(labels, left_on="v", right_on="u", how="left")` is not the same thing as a canonicalized or symmetricized edge list. The other difference is that this is repeating this same operation until the label pairs are equal. It does end up taking multiple iterations as I've observed, so its not a one-op silver-bullet.
 

@@ -177,9 +177,9 @@ class MinHashDedupePipeline:
         """Execute the full deduplication pipeline on the input DataFrame, returning deduplicated results."""
         df_prep = self.prep(input).collect()
         df_norm = self.normalize(df_prep, self.remove_punct, self.lowercase, self.nfd_unicode, self.white_space)
-        df_minh = self.minhash(df_norm, self.num_perm, self.ngram_size, self.seed, self.hash_function).collect()
+        df_minh = self.minhash(df_norm, self.num_perm, self.ngram_size, self.seed, self.hash_function)
         df_node, id_map = self.prep_node_id_index_map(df_minh)
-        df_bands = self.lsh_banding(df_node, self.R, self.B).collect()
+        df_bands = self.lsh_banding(df_node, self.R, self.B)
         assigns = self.connected_components_2(df_bands, self.algorithm, self.max_loops, self.igraph_validate)
         results = self.merge_results(df_prep, assigns, id_map)
         return results
@@ -273,7 +273,7 @@ class MinHashDedupePipeline:
             .where(~col("u").is_null())
             .where(~col("v").is_null())
             .distinct()
-            .collect()
+            
         )
     
     def _large_star(self, edges: DataFrame) -> DataFrame:
@@ -283,7 +283,7 @@ class MinHashDedupePipeline:
             edges
             .select("u", "v")
             .union_all(edges.select(col("v").alias("u"), col("u").alias("v")))
-            .collect()
+            
         )
 
         # Step 2: Group by u, and aggregate the list of v's
@@ -310,7 +310,7 @@ class MinHashDedupePipeline:
                 .select(col("nbrs").alias("u"), col("m").alias("v"))
                 .where(col("u") != col("v"))
                 .distinct()
-                .collect()
+                
         )
 
         return out
@@ -352,7 +352,7 @@ class MinHashDedupePipeline:
                 .select(col("nbrs").alias("u"), col("m").alias("v"))
                 .where(col("u") != col("v"))
                 .distinct()
-                .collect()
+                
         )
         
         return out
@@ -373,13 +373,13 @@ class MinHashDedupePipeline:
             edges
             .select("u", "v")
             .union_all(edges.select(col("v").alias("u"), col("u").alias("v")))
-            .collect()
+            
         )
 
     def check_canonical_set_equality(self, prev_edges: DataFrame, curr_edges: DataFrame) -> bool:
         """Check if two edge DataFrames represent the same set after canonicalization."""
-        prev_can = self.canonicalize(prev_edges).collect().to_pydict()
-        curr_can = self.canonicalize(curr_edges).collect().to_pydict()
+        prev_can = self.canonicalize(prev_edges).to_pydict()
+        curr_can = self.canonicalize(curr_edges).to_pydict()
         prev_set = set(zip(prev_can["u"], prev_can["v"]))
         curr_set = set(zip(curr_can["u"], curr_can["v"]))
         return prev_set == curr_set
@@ -416,7 +416,7 @@ class MinHashDedupePipeline:
             )
             .select("u", "rep")                    # keep only node and its rep
             .distinct()                            # deduplicate any duplicates
-            .collect()                             # materialize the result
+                                         # materialize the result
         )
         return assignments
 
@@ -459,7 +459,7 @@ class MinHashDedupePipeline:
         E = self.symmetrize(b)
 
         # Initialize labels from current assignments: rep becomes the working label per node
-        labels = assignments.select(col("u"), col("rep").alias("label")).collect()
+        labels = assignments.select(col("u"), col("rep").alias("label"))
 
         lp_iters = 0
         lp_max_iters = 100
@@ -473,7 +473,7 @@ class MinHashDedupePipeline:
                 .select(col("u").alias("node"), col("label"))
                 .groupby("node")
                 .agg(col("label").min().alias("nbr_min"))
-                .collect()
+                
             )
 
             # Lower each node's label to min(current_label, neighbor_min_label)
@@ -489,13 +489,12 @@ class MinHashDedupePipeline:
                 )
                 .select(col("u"), col("label"))
                 .distinct()
-                .collect()
             )
 
             # Convergence: compare pair sets after casting back to (u, rep)
             if self._pairs_equal(
-                assignments.select(col("u"), col("rep").alias("label")).select(col("u"), col("label").alias("rep")),
-                labels_next.select(col("u"), col("label").alias("rep")),
+                assignments.select(col("u"), col("rep").alias("label")).select(col("u"), col("label").alias("rep")).collect(),
+                labels_next.select(col("u"), col("label").alias("rep")).collect(),
             ):
                 break
 
@@ -594,7 +593,7 @@ class MinHashDedupePipeline:
                 assignments
                 .groupby("rep")
                 .agg(col("u").agg_list().alias("members"))
-                .collect()
+                
             )
             pdf = ours_grouped.to_pandas()
             ours_comps = {frozenset(m) for m in pdf["members"]}
