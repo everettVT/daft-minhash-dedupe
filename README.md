@@ -1,6 +1,6 @@
 <div align="center">
 
-# daft Minhash Deduplication
+# Daft Minhash Deduplication
 
 Canonical Multimodal Workload Sandbox for Minhash Deduplication on Common Crawl HTML Documents using daft Dataframes
 
