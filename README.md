@@ -1,15 +1,15 @@
 <div align="center">
 
-# Daft Minhash Deduplication
+# daft Minhash Deduplication
 
-Canonical Multimodal Workload Sandbox for Minhash Deduplication on Common Crawl HTML Documents using Daft Dataframes
+Canonical Multimodal Workload Sandbox for Minhash Deduplication on Common Crawl HTML Documents using daft Dataframes
 
 </div>
 
 ---
 
 ## Overview
-`minhash_dedupe.py` implements a scalable deduplication pipeline using MinHash and Locality-Sensitive Hashing (LSH) for processing large text datasets, such as Common Crawl HTML extracts. It leverages Daft (a distributed DataFrame library) for efficient computation, including text normalization, MinHash signature generation, LSH banding, and connected components for clustering duplicates. The pipeline is designed for high-throughput deduplication while minimizing false positives/negatives via optimized parameters.
+`minhash_dedupe.py` implements a scalable deduplication pipeline using MinHash and Locality-Sensitive Hashing (LSH) for processing large text datasets, such as Common Crawl HTML extracts. It leverages daft (a distributed DataFrame library) for efficient computation, including text normalization, MinHash signature generation, LSH banding, and connected components for clustering duplicates. The pipeline is designed for high-throughput deduplication while minimizing false positives/negatives via optimized parameters.
 
 Key goals: Identify and remove near-duplicate text blocks (e.g., from web crawls) based on Jaccard similarity thresholds, outputting unique representatives.
 
@@ -21,7 +21,7 @@ Key goals: Identify and remove near-duplicate text blocks (e.g., from web crawls
 
 2. **Text Normalization**:
    - Optional: Remove punctuation, lowercase, NFD Unicode normalization, whitespace cleanup.
-   - Applied via Daft's string functions for consistency.
+   - Applied via daft's string functions for consistency.
 
 3. **MinHash & LSH**:
    - Computes MinHash signatures (e.g., 64 permutations, 5-grams) using XXHash.
@@ -58,7 +58,7 @@ In order to access the Common Crawl dataset from S3 you will need to authenticat
 
 ## Usage
 - **Instantiation**: Create a `MinHashDedupePipeline` object with params (e.g., `num_perm=64`, `threshold=0.7`). Note not all thresholds work for any number of permutations. The pipeline will assert an error upon instantiation if this is the case. 
-- **Running**: Call `pipeline(df)` on a preprocessed Daft DataFrame (e.g., from `preprocess_common_crawl_html`).
+- **Running**: Call `pipeline(df)` on a preprocessed daft DataFrame (e.g., from `preprocess_common_crawl_html`).
 - **Main Script**: Handles S3 I/O, env vars, and full pipeline execution for Common Crawl segments.
 - **Example** (from main):
   ```python
@@ -75,7 +75,7 @@ In order to access the Common Crawl dataset from S3 you will need to authenticat
 - **I/O**: S3 configs via `IOConfig`; supports Ray for partitioning.
 
 ## Quick Onboarding Tips
-- **Dependencies**: Daft, Selectolax, SciPy, igraph (optional), Ray (for large-scale).
+- **Dependencies**: daft, Selectolax, SciPy, igraph (optional), Ray (for large-scale).
 - **Testing**: Use small `ROW_LIMIT` for local runs; check `friction/` dir for prototypes.
 - **Extensions**: Modular—extend normalization or add custom hash functions easily.
 - **Performance**: Scales to millions of rows; tune partitions for memory.

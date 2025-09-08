@@ -9,28 +9,61 @@
   
 ## Summary
 
-I had a pretty positive experience using daft for this workload. Daft was definitely more empowering than detracting across several key areas. Obviosuly it makes sense that I'd write custom UDFs for parsing html and preprocessing the warc payloads, but even that felt like a breeze. I then quickly found the text normalization and minhash expressions which made the next two steps of the pipeline fully trivial. I didn't need to know what I was doing, I just ran the transformation and everything worked! Once I got LSH banding I asked GPT-5 to build the next steps and it achieved it within a few tries. I got to this step within the first day which made me feel a little bit like superman, especially since this was the first time I had ever been introduced to the Minhash Deduplication Workload.
+Overall, I had a pretty positive experience using daft for this workload. I definitely felt more empowered than burdened across several key areas. While my aim for any daft workload is to use as many daft primatives as possible, it felt easy to write UDFs to preprocess the warc payloads and parsing html, but even that felt like a breeze. I then quickly found the text normalization and minhash expressions which made the next two steps of the pipeline fully trivial. I didn't need to know what I was doing, I just ran the transformation and everything worked! Once I got LSH banding I asked GPT-5 to build the next steps and it achieved it within a few tries. I got to this step within the first day which made me feel a little bit like superman, especially since this was the first time I had ever been introduced to the Minhash Deduplication Workload.
 
-It was around this time that I got the reference script from the team and began adjusting my approach to match. You can see how my unfiltered notebook kind of abrubtly ends around connected components since I had been developing in the notebook to start and had begun to translate the script. I was able to run everything up until the large star algorithm which threw an exception for a small bug referencing the wrong column, but since I was still naive to what I was really changing I then transitioned to interactive debugging in a script. Little did I know just how many rabbit holes I was about to go down.
+I had the opposite experience with Connected Components. Unfortunately, the reference pipeline I was referencing couldn't run without errors and I ended up having to ditch the approach. I go into full detail on my various headaches in the sections below, but eventually I ended up successfully impelementing connected components from referencing the original *Connected Components in MapReduce and Beyond* paper. Throughout this time, I wasn't fighting daft's semantics more so than I was debugging my implementation of the algorithm. In fact I found daft to be quite empowering at this stage as well. The wrapped parenthesis pattern is particularly helpful for interactive debugging and helped me isolate errors quickly.
 
-For the next several days I debugged trying the existing approach. At first I was just trying to get the connected components section to run, referencing the provided script as well as the pyspark implementation. Eventually able to get the workload running, but it yielded no duplicates. Then I was able to yield duplicates, but the number of rows grew in size, now diminished. Finally I was seeing the results I was expecting but I was unable to validate them against igraph. I knew somewhere along the way I had improperly implemented the Large and Small star trasnformations and was having a difficult time interpreting where I had gone wrong. All of this was due to my own misunderstanding of the workload, and less so with Daft. Daft had all the core primatives that I needed. I just needed to translate the theory into practice. Eventualy I had to start from first principles and break down the operations step by step.
-
-At this point, the work had bled into the weekend and I was desperate for an answer. It was late into the morning when I decided to leverage an AI agent to help me achieve parity with iGraph. The [explanation from GPT-5](/friction/connected_components_reasoning.md) details what it found in the moment. In the end, it was this breakthrough that helped me complete the worklaod and validate my results. 
-
-I tested multiple orders of maginitude of documents locally 
+The most important take away in my experience was my debugging experience trying to get the connected components section to work. This was where I ran into the most pain. The algorithm is non-trivial to implement and represents a real opportunity to simplify the lives of users. The minhash and normalization expressions worked flawlessly the first time, and I found their api's intuitive and trivial to implement. Getting access to s3 worked the first time and setting the `IOConfig` was trivial. I didn't remember how to set the default io config globally and had a hard time finding the 
 
 ## Context
 
-The 
+This weeks workload was focused on Minhash Deduplication spanning the following steps: 
+
+- AWS Authentication
+- Loading and Preprocessing Common Crawl WARC Tables
+- Text Normalization
+- MinHash Calculation
+- LSH Banding
+- Connected Components
+- Merge Results
+
+
+It was around this time that I got the reference script from the team and began adjusting my approach to match. You can see how my unfiltered notebook kind of abrubtly ends around connected components. I was able to run everything up until the large star algorithm which threw an exception for a small bug in `col("u").list.map(...)` operation that needed to be adjusted to referencethe wrong column, but since I was still naive to what I was really changing I then transitioned to interactive debugging in a script. Little did I know just how many rabbit holes I was about to go down.
+
+For the next several days I debugged trying the existing approach. At first I was just trying to get the connected components section to run, referencing the provided script as well as the pyspark implementation. I was eventually able to get the workload running, but it yielded no duplicates. Then I was able to yield duplicates, but the number of rows grew in size, instead of reducing. Finally I was seeing the results I was expecting but I was unable to validate them against igraph. The results weren't close. I knew somewhere along the way I had improperly implemented the Large and Small star trasnformations and was having a difficult time identifying where I had gone wrong.
+
+Most of these headaches were due to my unfamliarity with the theory, and less so with daft. daft had all the core primatives that I needed. I just struggles to translate the theory into practice. Eventualy I had to start from first principles and break down the operations step by step.
+
+At this point, the work had bled into the weekend and I was desperate for an answer. It was late into the morning when I decided to leverage an AI agent to help me achieve parity with iGraph. The [explanation from GPT-5](/friction/connected_components_reasoning.md) details the solution it found in the moment.
+
+After careful review, one of the sections it added was just fixing an error I had in my Small Star operation and the other turned out to be genuinely necessary. This was the 
+
+
+In the end, it was this breakthrough that helped me complete the worklaod and validate my results.
+
+I tested multiple orders of maginitude of documents locally 
+
 
 ## Friction Points
 The [unfiltered notebook](daft-minhash-dedupe/friction/UNFILTERED_minhash_dedupe_common_crawl.ipynb) captures my experience end-to-end building the workload up until I began debugging connected components. I
 
-1. 
+### 1. No usage examples for setting the default io_config 
 
+The `set_planning_config(default_io_config=IO_CONFIG)` is really only documented in the API and is probably the most common way people will authenticate with cloud providers. Searching ioconfig in the docs only yields the `IOConfig` class and usage examples only implement it as a temporary credential.  I'm not sure how often users will ever set io_config more than once, so I'd argue most examples should set the default. 
 
-### Wildcard usage patterns and the hot pink accent color
-I've got nothing against the recent brand redesign, but the hot pink needs to be toned down a bit. The AI age tends to encourage maximalism in color choice and aesthetic appeal, however the particular tone of daft's primary color is a bit to harsh. I figured I might as well mention this as a part of an actual issue I ran into that is a bit more practical.
+### 1. Forgot about Wildcard usage patterns and the hot pink accent color
+
+For some reason when I attempted to load WARC files using I decided to grab all of the file paths using `daft.from_glob_path()` (probably to get a deterministic list of warc files to read) which I then naively tried to load with `url.download()`. Unfortunately the operation hangs indefinitely in a jupyer notebook which means I have to restart the kernel and try something new. Having something that fails fast here with solid error messages would be nice. 
+
+Naturally this brings up the question of why I didn't try `daft.read_warc(uri)` right away. In the moment I was hoping to read a specific file to work with the same data every time. In fact, in all of my scripts I am using a non deterministic wildcard pattern and end up loading different data every time. This turned out to be great for developing this workload robustly, but end
+
+### 2. Wildcard Usage Pattern Confusion with `url.download()`
+
+**Problem**: When attempting to load WARC files using `daft.from_glob_path()` followed by `url.download()`, the operation hangs indefinitely. The intuitive pattern of using `df.with_column("warc", col("path").url.download())` fails for S3 paths. This is definitely user error, but since a jupyter notebook cell hangs until it crashes the kernel it feels more like a bug.
+
+**Root Cause**: The `url.download()` doesn't play nicely with tables 
+
+**Solution Discovered**: Use `daft.read_warc()` directly with wildcard patterns instead of the two-step approach. 
 
 I was trying to take advantage of `daft.from_glob_path` to grab all the file paths from common crawl with a matching wildcard url signature and then ran into this funny usage pattern where I realized I couldn't download the warc files with `df.url.download()`. This might sound obvious, but even as a daft power user I forgot that I can just wildcard `daft.read_warc()`. The `from_glob_path` reader screams "use me to find files with wildcards" and so thats where my mind went.
 
@@ -42,18 +75,20 @@ For vehicle logs, we had these resumable http endpoints that sinked to VIN/day/E
 
 My point here is that its super common for data engineers to impelement specific prefix structures on raw data in s3 which requires to be read with non-trivial wildcard addresses. This is a super common and practical use case for demonstrating `IO` reads/writes with wildcards. Especially for raw data.
 
-I'd know that Daft can support wildcards if I just looked at the second section of the front page of the guide. The only thing is my eyes breeze right past the demonstrated usage patterns because the pink formatting on the code is so intense. My eyers will just avert subconciously.
+I'd know that daft can support wildcards if I just looked at the second section of the front page of the guide. The only thing is my eyes breeze right past the demonstrated usage patterns because the pink formatting on the code is so intense. My eyers will just avert subconciously. 
+
+Obviously this is minor. 
 
 ### Pre-processing WARC HTML Payloads
 
 I'm a bit hesitant to even include this section because I'm not sure my headaches were so much a matter of daft not supplying helpful primatives, and more so learning how to parse the warc_content payload. A part from learning about the payload format itself, which is a byte string comprised of both the HTTP header as well as the payload, there were a couple strategies that I tried with daft that didn't end up working the way I expected.
 
 ### Slow-brain - can't figure out list construction for minimum over multiple columns. 
-I'm running into this funny moment where I want to take the minimum between a known variable and a calculated row-wise vairable and can't think of how to do it without a a row-wise udf. In the band explosion, if you use the naive B, then you risk trying to create entries for minhashes that dont exist.
+I'm running into this funny moment where I want to take the minimum between a known variable and a calculated row-wise vairable and can't think of how to do it without a row-wise udf. In the band explosion, if you use the naive B, then you risk trying to create entries for minhashes that dont exist. I ran into this when I transitioned the pipeline from full document deduplication to block level deduplication where an individual block may have less than `B` tokens in it's contents.
 
-I ran into this when I transitioned the pipeline from full document deduplication to block level deduplication where an individual block may have less than `B` tokens in it's contents.
+For now I'll just stick with a udf since its intutive, but since I have to derive a `min` argumnet from an existing column, the operation turns into more steps than I would have liked. This pain point is fundamentally due to not being able to easily append or build lists. 
 
-For now I'll just stick with a udf since its intutive, but since I have to derive a `min` argumnet from an existing column, the operation turns into more steps than I would have liked. This pain point is fundamentally due to not being able to easily append or build lists.
+Coming back to this, I ended up finding the `list_` constructor, but ended up adopting a two step approach and keeping the udf. 
 
 ### Large Star and Short Star Debugging Headache
 
@@ -79,15 +114,6 @@ Considering the amount of frustration and pain I had in debugging the correctnes
 
 #### The algo was the hardest part.
 
-I really can't emphasize enough just how much this week's focus was on the algorithm than daft itself. With a few minor exceptions, daft had pretty much everything I needed to build this solution, it was just a matter of getting everything working and validated. If anything, daft made it super easy to debug anywhere I needed to. I mentioned this on the slack channel but I really like this wrapped parentheses pattern for aggregating lazy transformations. 
+I really can't emphasize enough just how much this week's focus was on the algorithm than daft itself. With a few minor exceptions, daft had pretty much everything I needed to build this solution, it was just a matter of getting everything working and validated. If anything, daft made it super easy to debug anywhere I needed to. I mentioned this on the slack channel but I really like this wrapped parentheses pattern for aggregating lazy transformations.
 
 I can just drop a breakpoint anywhere in the transformation list, add a `.show()` and inspect the data. I can also quickly add select or where filters to quickly visualize just the data I care about, and the pretty table I get in the terminal is just nice to look at. I know we kind of take it for granted at this point, but when I was working with pandas for converting the data to the igraph constructor, I was surprised at how opaque the prints were.
-
-### Daft Pain points in the developing the multimodal structured outputs workload
-
-#### Preprocessing
-
-
-
-## Conclusion
-
