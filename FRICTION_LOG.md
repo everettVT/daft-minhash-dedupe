@@ -1,13 +1,12 @@
 # Friction Log - Minhash Deduplication on Common Crawl
 
-- Date: Sep 5, 2025
+- Date: Sep 9, 2025
 - Author: Everett Kleven
 - Size: L
 - Persona: LLM Dataset Curation Data Scientist
 - [Notebook](/workload/minhash_dedupe_common_crawl.ipynb)
 - [Python Script](/workload/minhash_dedupe.py)
 - [Results](/workload/results.txt)  
-
 
 ## Context
 
@@ -32,14 +31,7 @@ My experience with Connected Components, as unfortunate as it was had more to do
 
 I ran the pipeline at a variety of scales on the Native Runner, with promising results. It does appear that eager materialization improves performance significantly following preprocessing, and lsh banding. This deserves more investigation, but I think the reality is that with the number of explodes and groub_by's in this pipeline, it just makes sense to break it up.
 
-
-## Grease Points (The Good)
-
-
-
-
-
-## Friction Points (The Bad)
+## Friction Points
 
 The [unfiltered notebook](daft-minhash-dedupe/friction/UNFILTERED_minhash_dedupe_common_crawl.ipynb) captures my experience end-to-end building the workload up until I began debugging connected components. I
 
@@ -167,7 +159,7 @@ Devils advocate would say, "I'd know that daft can support wildcards if I just l
 
 Yes. Absolutley. Theres just one catch with this. I'm not sure if anyone else feels similar, but my eyes breeze right past the demonstrated usage patterns because the pink formatting on the code is so intense. When I went to look for the usage patterns, my retinas told me to breeze past them. Maybe this is just a dark mode thing, but it is worth mentioning.
 
-## Raw Take (The Ugly)
+## Raw Take
 
 First thing I want to say is that for anyone who is new to minhash dedupe, the algorithm itself has a lot of new vocabulary...
 
@@ -191,9 +183,6 @@ Little did I know how much longer it would take until I would arrive at the corr
 Eventually I ended up implementing Connected Components from first priciples by using the [*Connected Components in MapReduce and Beyond*] paper as a reference.
 
 This was a long and excrutiating process. I honestly can't even begin to explain just how many iterations I tried. Having igraph as a reference was huge. NetworkX is the canonical reference for python, but its probably 20x slower. (iGraph's core is written in C). Without this validation, I would have shipped something that would have "appeared" correct, but wasn't.
-
-
-
 
 #### A genuine moment of artificial intelligence yielding emergent results
 
