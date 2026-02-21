@@ -5,7 +5,7 @@ description = "Minhash Deduplication Workload over Common Crawl Dataset with daf
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "daft[aws,ray,pandas]>=0.6.0",
+    "daft[aws,ray,pandas,iceberg,lance]>=0.6.0",
     "python-dotenv",
     "ipykernel",
     "ipywidgets",
